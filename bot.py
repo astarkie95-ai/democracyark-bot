@@ -1,328 +1,454 @@
 import os
+import json
 import csv
-import sqlite3
-from typing import Optional
+import threading
+from typing import List, Optional, Dict, Any
 
-import discord
-from discord import app_commands
 from flask import Flask
-from threading import Thread
+import discord
+from discord.ext import commands
 from dotenv import load_dotenv
 
-# Load environment variables from .env (local dev)
 load_dotenv()
 
-# ---------------------------
-# CONFIG (edit via commands)
-# ---------------------------
-DB_PATH = "starter_pins.db"
-PINS_CSV_PATH = "pins.csv"
+# ----------------------------
+# Config / Files
+# ----------------------------
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-TOKEN = os.getenv("DISCORD_TOKEN")  # REQUIRED
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))  # optional but recommended (your user id)
+PINS_CSV_PATH = os.getenv("PINS_CSV_PATH", "pins.csv")
+CLAIMS_PATH = os.getenv("CLAIMS_PATH", "claims.json")
+POLL_STORE_PATH = os.getenv("POLL_STORE_PATH", "polls.json")
 
-# ---------------------------
-# Keep-alive web server (useful on some hosts)
-# ---------------------------
+BOX_COUNT = int(os.getenv("BOX_COUNT", "10"))  # boxes 1..BOX_COUNT
+
+# Up to 10 options
+NUMBER_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+
+# ----------------------------
+# Flask keep-alive (Railway friendly)
+# ----------------------------
 app = Flask(__name__)
 
 @app.get("/")
 def home():
-    return "bot is alive", 200
+    return "OK", 200
 
 def run_web():
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
 
-Thread(target=run_web, daemon=True).start()
-
-
-# ---------------------------
-# Database helpers
-# ---------------------------
-def db():
-    return sqlite3.connect(DB_PATH)
-
-def init_db():
-    con = db()
-    cur = con.cursor()
-
-    # settings table for channel restrictions etc.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-
-    # pins table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pins (
-            pin TEXT PRIMARY KEY,
-            claimed_by_user_id INTEGER,
-            claimed_at TEXT
-        )
-    """)
-
-    con.commit()
-    con.close()
-
-def set_setting(key: str, value: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
-    con.commit()
-    con.close()
-
-def get_setting(key: str) -> Optional[str]:
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    con.close()
-    return row[0] if row else None
-
-def load_pins_from_csv_if_db_empty():
-    # If DB already has pins, do nothing
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM pins")
-    count = cur.fetchone()[0]
-    con.close()
-    if count > 0:
-        return
-
-    if not os.path.exists(PINS_CSV_PATH):
-        return
-
-    pins = []
-    with open(PINS_CSV_PATH, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row:
-                continue
-            pin = str(row[0]).strip()
-            if pin and pin.isdigit() and len(pin) == 4:
-                pins.append(pin)
-
-    if not pins:
-        return
-
-    con = db()
-    cur = con.cursor()
-    for pin in pins:
-        cur.execute("INSERT OR IGNORE INTO pins(pin, claimed_by_user_id, claimed_at) VALUES(?, NULL, NULL)", (pin,))
-    con.commit()
-    con.close()
-
-def is_admin(interaction: discord.Interaction) -> bool:
-    # Allow either:
-    # - You set ADMIN_USER_ID in .env
-    # - Or the user has Administrator permission in the server
-    if ADMIN_USER_ID and interaction.user.id == ADMIN_USER_ID:
-        return True
-    if interaction.guild and isinstance(interaction.user, discord.Member):
-        return interaction.user.guild_permissions.administrator
-    return False
-
-def channel_allowed(interaction: discord.Interaction, setting_key: str) -> bool:
-    """
-    setting_key = "claim_channel_id" or "admin_channel_id"
-    If not set -> allow everywhere (so you don't lock yourself out by accident)
-    If set -> only allow in that channel
-    """
-    allowed_id = get_setting(setting_key)
-    if not allowed_id:
-        return True
-    try:
-        return interaction.channel_id == int(allowed_id)
-    except ValueError:
-        return True
-
-
-# ---------------------------
-# Discord client
-# ---------------------------
+# ----------------------------
+# Discord bot setup
+# ----------------------------
 intents = discord.Intents.default()
+intents.message_content = True  # needed for prefix commands
+intents.reactions = True        # needed to enforce one vote per person
+intents.guilds = True
 
-class MyClient(discord.Client):
-    def __init__(self):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-    async def setup_hook(self):
-        init_db()
-        load_pins_from_csv_if_db_empty()
-        await self.tree.sync()
+# ----------------------------
+# Helpers: JSON storage
+# ----------------------------
+def _load_json(path: str, default: Any) -> Any:
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-    async def on_ready(self):
-        print(f"Logged in as {self.user} (ID: {self.user.id})")
-        # Pin stats
-        con = db()
-        cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM pins")
-        total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM pins WHERE claimed_by_user_id IS NULL")
-        remaining = cur.fetchone()[0]
-        con.close()
-        print(f"Bot is online")
-        print(f"Pins: total={total}, remaining={remaining}")
+def _save_json(path: str, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
+# ----------------------------
+# Starter kit pins/claims helpers
+# ----------------------------
+def _load_claims() -> dict:
+    return _load_json(CLAIMS_PATH, {})
 
-client = MyClient()
+def _save_claims(claims: dict) -> None:
+    _save_json(CLAIMS_PATH, claims)
 
+def _load_pins() -> List[str]:
+    if not os.path.exists(PINS_CSV_PATH):
+        return []
+    pins: List[str] = []
+    with open(PINS_CSV_PATH, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            p = (row.get("pin") or "").strip()
+            if p:
+                pins.append(p)
+    return pins
 
-# ---------------------------
-# Commands
-# ---------------------------
+def _save_pins(pins: List[str]) -> None:
+    with open(PINS_CSV_PATH, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["pin"])
+        writer.writeheader()
+        for p in pins:
+            writer.writerow({"pin": p})
 
-@client.tree.command(name="ping", description="Check if the bot is responsive.")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong ✅", ephemeral=True)
+def _pop_next_pin() -> Optional[str]:
+    pins = _load_pins()
+    if not pins:
+        return None
+    next_pin = pins.pop(0)
+    _save_pins(pins)
+    return next_pin
 
+def _get_next_available_box(claims: dict) -> Optional[int]:
+    used = set()
+    for v in claims.values():
+        try:
+            b = int(v.get("box", 0))
+            if b > 0:
+                used.add(b)
+        except Exception:
+            pass
+    for box_num in range(1, BOX_COUNT + 1):
+        if box_num not in used:
+            return box_num
+    return None
 
-@client.tree.command(name="pinstatus", description="Show how many starter PINs remain.")
-async def pinstatus(interaction: discord.Interaction):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM pins")
-    total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM pins WHERE claimed_by_user_id IS NULL")
-    remaining = cur.fetchone()[0]
-    con.close()
+# ----------------------------
+# Poll storage helpers
+# ----------------------------
+# Stored as:
+# {
+#   "<message_id>": {
+#       "guild_id": 123,
+#       "channel_id": 456,
+#       "creator_id": 789,
+#       "title": "...",
+#       "options": ["...", "..."],
+#       "emoji_map": {"1️⃣": 0, "2️⃣": 1, ...},
+#       "closed": false
+#   }
+# }
+def _load_polls() -> Dict[str, Any]:
+    return _load_json(POLL_STORE_PATH, {})
 
-    await interaction.response.send_message(
-        f"📌 Pins: **{remaining}** remaining out of **{total}**.",
-        ephemeral=True
-    )
+def _save_polls(polls: Dict[str, Any]) -> None:
+    _save_json(POLL_STORE_PATH, polls)
 
+def _is_admin(ctx: commands.Context) -> bool:
+    if not isinstance(ctx.author, discord.Member):
+        return False
+    perms = ctx.author.guild_permissions
+    return perms.administrator or perms.manage_messages
 
-@client.tree.command(name="claimstarter", description="Claim a starter kit PIN (one per user).")
-async def claimstarter(interaction: discord.Interaction):
-    # Restrict this command to claim channel (if set)
-    if not channel_allowed(interaction, "claim_channel_id"):
-        claim_id = get_setting("claim_channel_id")
-        msg = "This command is not allowed in this channel."
-        if claim_id:
-            msg += f" Use it in <#{claim_id}>."
-        await interaction.response.send_message(msg, ephemeral=True)
+# ----------------------------
+# Events
+# ----------------------------
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    # Enforce "one vote per person" on tracked polls only
+    if user.bot:
         return
 
-    con = db()
-    cur = con.cursor()
+    message = reaction.message
+    polls = _load_polls()
+    poll = polls.get(str(message.id))
+    if not poll:
+        return
 
-    # already claimed?
-    cur.execute("SELECT pin FROM pins WHERE claimed_by_user_id=?", (interaction.user.id,))
-    row = cur.fetchone()
-    if row:
-        con.close()
-        await interaction.response.send_message(
-            f"You already claimed a starter PIN: **{row[0]}**",
-            ephemeral=True
+    # If closed, remove their reaction
+    if poll.get("closed", False):
+        try:
+            await reaction.remove(user)
+        except Exception:
+            pass
+        return
+
+    emoji_str = str(reaction.emoji)
+    emoji_map = poll.get("emoji_map", {})
+    if emoji_str not in emoji_map:
+        # Not one of the poll options; remove it to keep poll clean
+        try:
+            await reaction.remove(user)
+        except Exception:
+            pass
+        return
+
+    # One vote per person: remove any other poll-option reactions from this user
+    try:
+        for r in message.reactions:
+            r_emoji = str(r.emoji)
+            if r_emoji in emoji_map and r_emoji != emoji_str:
+                await r.remove(user)
+    except Exception:
+        # If bot lacks permission to manage reactions, this won't work
+        pass
+
+# ----------------------------
+# Starter kit claim (PIN + BOX #)
+# ----------------------------
+@bot.command(name="claimstarter")
+async def claimstarter(ctx: commands.Context):
+    if ctx.guild is None:
+        await ctx.reply("Run this in the server, not in DMs.")
+        return
+
+    user_id = str(ctx.author.id)
+    claims = _load_claims()
+
+    if user_id in claims:
+        box = claims[user_id].get("box", "?")
+        await ctx.reply(f"You’ve already claimed your starter kit. Your box is **#{box}**. Check your DMs for the PIN.")
+        return
+
+    box_num = _get_next_available_box(claims)
+    if box_num is None:
+        await ctx.reply("All starter kit boxes are currently assigned. Ask an admin to reset boxes when ready.")
+        return
+
+    pin = _pop_next_pin()
+    if not pin:
+        await ctx.reply("No starter kit PINs are available right now. Ask an admin to add more.")
+        return
+
+    claims[user_id] = {"username": str(ctx.author), "pin": pin, "box": box_num}
+    _save_claims(claims)
+
+    try:
+        await ctx.author.send(
+            f"✅ **Democracy Ark Starter Kit**\n\n"
+            f"📦 **Your box number:** **#{box_num}**\n"
+            f"🔐 **Your PIN:** **{pin}**\n\n"
+            f"Go to the Community Hub and open **Box #{box_num}** with that PIN.\n"
+            f"Keep this private."
         )
+        await ctx.reply(f"✅ Check your DMs — I’ve sent your PIN and your box number (**#{box_num}**).")
+    except discord.Forbidden:
+        await ctx.reply("I can’t DM you (your DMs are closed). Please open DMs and try again.")
+
+# ----------------------------
+# Admin: pins/claims/boxes
+# ----------------------------
+@bot.command(name="addpin")
+@commands.has_permissions(administrator=True)
+async def addpin(ctx: commands.Context, pin: str):
+    pin = pin.strip()
+    if not pin:
+        await ctx.reply("Missing PIN.")
+        return
+    pins = _load_pins()
+    pins.append(pin)
+    _save_pins(pins)
+    await ctx.reply(f"✅ Added PIN. Remaining unclaimed PINs: **{len(pins)}**")
+
+@bot.command(name="pinsleft")
+@commands.has_permissions(administrator=True)
+async def pinsleft(ctx: commands.Context):
+    pins = _load_pins()
+    await ctx.reply(f"📦 Remaining unclaimed PINs: **{len(pins)}**")
+
+@bot.command(name="resetclaim")
+@commands.has_permissions(administrator=True)
+async def resetclaim(ctx: commands.Context, member: discord.Member):
+    claims = _load_claims()
+    uid = str(member.id)
+    if uid not in claims:
+        await ctx.reply("That user has no claim recorded.")
+        return
+    old = claims.pop(uid)
+    _save_claims(claims)
+    await ctx.reply(f"✅ Reset claim for {member.mention}. (Old PIN: {old.get('pin')} • Box: #{old.get('box')})")
+
+@bot.command(name="resetboxes")
+@commands.has_permissions(administrator=True)
+async def resetboxes(ctx: commands.Context):
+    _save_claims({})
+    await ctx.reply("✅ All starter kit boxes have been reset (all claims cleared).")
+
+@bot.command(name="boxstatus")
+@commands.has_permissions(administrator=True)
+async def boxstatus(ctx: commands.Context):
+    claims = _load_claims()
+    used = sorted({int(v.get("box", 0)) for v in claims.values() if str(v.get("box", "")).isdigit()})
+    used = [b for b in used if b > 0]
+    if not used:
+        await ctx.reply("📦 No boxes are currently assigned.")
+        return
+    await ctx.reply("📦 Assigned boxes: " + ", ".join([f"#{b}" for b in used]))
+
+# ----------------------------
+# Poll system (proper)
+# ----------------------------
+@bot.command(name="pollcreate")
+@commands.has_permissions(manage_messages=True)
+async def pollcreate(ctx: commands.Context, title: str, *options: str):
+    # admins only (Manage Messages)
+    if len(options) < 2:
+        await ctx.reply("Need at least 2 options.")
+        return
+    if len(options) > 10:
+        await ctx.reply("Max 10 options.")
         return
 
-    # get an unclaimed pin
-    cur.execute("SELECT pin FROM pins WHERE claimed_by_user_id IS NULL ORDER BY pin LIMIT 1")
-    row = cur.fetchone()
-    if not row:
-        con.close()
-        await interaction.response.send_message("No pins remaining 😭", ephemeral=True)
-        return
+    # build embed
+    lines: List[str] = []
+    emoji_map: Dict[str, int] = {}
+    for i, opt in enumerate(options):
+        em = NUMBER_EMOJIS[i]
+        emoji_map[em] = i
+        lines.append(f"{em} {opt}")
 
-    pin = row[0]
-    cur.execute(
-        "UPDATE pins SET claimed_by_user_id=? , claimed_at=datetime('now') WHERE pin=? AND claimed_by_user_id IS NULL",
-        (interaction.user.id, pin)
+    embed = discord.Embed(
+        title="📊 Poll",
+        description=f"**{title}**\n\n" + "\n".join(lines),
+        color=discord.Color.blurple()
     )
-    con.commit()
-    con.close()
+    embed.set_footer(text=f"One vote per person • Started by {ctx.author.display_name}")
 
-    await interaction.response.send_message(
-        f"✅ Your starter PIN is: **{pin}**\n"
-        f"Use it on the in-game locker. (Keep this private.)",
-        ephemeral=True
+    msg = await ctx.send(embed=embed)
+
+    # add reactions
+    for i in range(len(options)):
+        await msg.add_reaction(NUMBER_EMOJIS[i])
+
+    # store poll
+    polls = _load_polls()
+    polls[str(msg.id)] = {
+        "guild_id": ctx.guild.id if ctx.guild else None,
+        "channel_id": ctx.channel.id,
+        "creator_id": ctx.author.id,
+        "title": title,
+        "options": list(options),
+        "emoji_map": emoji_map,
+        "closed": False
+    }
+    _save_polls(polls)
+
+    await ctx.reply(f"✅ Poll created. Message ID: `{msg.id}`", mention_author=False)
+
+@bot.command(name="pollresults")
+async def pollresults(ctx: commands.Context, message_id: int):
+    polls = _load_polls()
+    poll = polls.get(str(message_id))
+    if not poll:
+        await ctx.reply("Poll not found.")
+        return
+
+    # fetch message
+    try:
+        channel = await bot.fetch_channel(int(poll["channel_id"]))
+        msg = await channel.fetch_message(int(message_id))
+    except Exception:
+        await ctx.reply("I can’t fetch that poll message.")
+        return
+
+    emoji_map = poll.get("emoji_map", {})
+    options = poll.get("options", [])
+    counts = [0] * len(options)
+
+    # count reactions (exclude bot’s own reaction)
+    for r in msg.reactions:
+        e = str(r.emoji)
+        if e in emoji_map:
+            # r.count includes the bot's own reaction; subtract 1 if bot reacted (it did)
+            n = max(0, r.count - 1)
+            idx = int(emoji_map[e])
+            if 0 <= idx < len(counts):
+                counts[idx] = n
+
+    total = sum(counts)
+    lines = []
+    for i, opt in enumerate(options):
+        lines.append(f"{NUMBER_EMOJIS[i]} {opt} — **{counts[i]}**")
+
+    status = "CLOSED" if poll.get("closed", False) else "OPEN"
+    embed = discord.Embed(
+        title=f"📊 Poll Results ({status})",
+        description="\n".join(lines) + f"\n\nTotal votes: **{total}**",
+        color=discord.Color.green() if poll.get("closed", False) else discord.Color.blurple()
     )
+    await ctx.send(embed=embed)
 
-
-@client.tree.command(name="setclaimchannel", description="Admin: set which channel /claimstarter works in.")
-async def setclaimchannel(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+@bot.command(name="pollclose")
+@commands.has_permissions(manage_messages=True)
+async def pollclose(ctx: commands.Context, message_id: int):
+    polls = _load_polls()
+    poll = polls.get(str(message_id))
+    if not poll:
+        await ctx.reply("Poll not found.")
         return
 
-    # Restrict admin commands to admin channel (if set)
-    if not channel_allowed(interaction, "admin_channel_id"):
-        admin_id = get_setting("admin_channel_id")
-        msg = "Admin commands are not allowed in this channel."
-        if admin_id:
-            msg += f" Use them in <#{admin_id}>."
-        await interaction.response.send_message(msg, ephemeral=True)
+    if poll.get("closed", False):
+        await ctx.reply("That poll is already closed.")
         return
 
-    set_setting("claim_channel_id", str(interaction.channel_id))
-    await interaction.response.send_message(
-        f"✅ Claim channel set to: <#{interaction.channel_id}>",
-        ephemeral=True
-    )
+    # mark closed
+    poll["closed"] = True
+    polls[str(message_id)] = poll
+    _save_polls(polls)
 
+    # update poll message footer
+    try:
+        channel = await bot.fetch_channel(int(poll["channel_id"]))
+        msg = await channel.fetch_message(int(message_id))
+        if msg.embeds:
+            embed = msg.embeds[0]
+            embed.set_footer(text=f"CLOSED • One vote per person • Started by <@{poll['creator_id']}>")
+            await msg.edit(embed=embed)
+    except Exception:
+        pass
 
-@client.tree.command(name="setadminchannel", description="Admin: set which channel admin commands work in.")
-async def setadminchannel(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+    await ctx.reply("✅ Poll closed. Votes are now locked (reactions removed if people try).")
+
+@bot.command(name="polldelete")
+@commands.has_permissions(manage_messages=True)
+async def polldelete(ctx: commands.Context, message_id: int):
+    polls = _load_polls()
+    poll = polls.get(str(message_id))
+    if not poll:
+        await ctx.reply("Poll not found.")
         return
 
-    set_setting("admin_channel_id", str(interaction.channel_id))
-    await interaction.response.send_message(
-        f"✅ Admin commands now restricted to: <#{interaction.channel_id}>",
-        ephemeral=True
-    )
+    # delete message
+    try:
+        channel = await bot.fetch_channel(int(poll["channel_id"]))
+        msg = await channel.fetch_message(int(message_id))
+        await msg.delete()
+    except Exception:
+        # even if deletion fails, remove from storage so it's not stuck
+        pass
 
+    polls.pop(str(message_id), None)
+    _save_polls(polls)
+    await ctx.reply("✅ Poll deleted.")
 
-@client.tree.command(name="addpins", description="Admin: add pins (comma/space separated). Example: 1234 2345 3456")
-@app_commands.describe(pins="Pins separated by spaces or commas")
-async def addpins(interaction: discord.Interaction, pins: str):
-    if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+@bot.command(name="polllist")
+@commands.has_permissions(manage_messages=True)
+async def polllist(ctx: commands.Context):
+    polls = _load_polls()
+    channel_id = ctx.channel.id
+    items = []
+    for mid, p in polls.items():
+        if int(p.get("channel_id", -1)) == channel_id:
+            status = "CLOSED" if p.get("closed", False) else "OPEN"
+            items.append(f"• `{mid}` — {status} — {p.get('title','(no title)')[:60]}")
+
+    if not items:
+        await ctx.reply("No tracked polls in this channel.")
         return
 
-    # Restrict admin commands to admin channel (if set)
-    if not channel_allowed(interaction, "admin_channel_id"):
-        admin_id = get_setting("admin_channel_id")
-        msg = "Admin commands are not allowed in this channel."
-        if admin_id:
-            msg += f" Use them in <#{admin_id}>."
-        await interaction.response.send_message(msg, ephemeral=True)
-        return
+    await ctx.reply("\n".join(items))
 
-    raw = pins.replace(",", " ").split()
-    cleaned = []
-    for p in raw:
-        p = p.strip()
-        if p.isdigit() and len(p) == 4:
-            cleaned.append(p)
+# ----------------------------
+# Main
+# ----------------------------
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        raise RuntimeError("DISCORD_TOKEN missing. Put it in Railway Variables.")
 
-    if not cleaned:
-        await interaction.response.send_message("No valid 4-digit pins found.", ephemeral=True)
-        return
-
-    con = db()
-    cur = con.cursor()
-    added = 0
-    for p in cleaned:
-        cur.execute("INSERT OR IGNORE INTO pins(pin, claimed_by_user_id, claimed_at) VALUES(?, NULL, NULL)", (p,))
-        if cur.rowcount > 0:
-            added += 1
-    con.commit()
-    con.close()
-
-    await interaction.response.send_message(f"✅ Added **{added}** pins.", ephemeral=True)
-
-
-# ---------------------------
-# Run
-# ---------------------------
-if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN missing. Put it in .env (local) or Railway Variables.")
-client.run(TOKEN)
+    threading.Thread(target=run_web, daemon=True).start()
+    bot.run(DISCORD_TOKEN)
