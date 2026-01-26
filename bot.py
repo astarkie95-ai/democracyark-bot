@@ -102,6 +102,40 @@ async def _wrong_channel(interaction: discord.Interaction, channel_name: str):
         await interaction.response.send_message(msg, ephemeral=True)
 
 # -----------------------
+# ✅ NEW: Helpers — generate NEW unique pin (used by /resetbox)
+# -----------------------
+def _all_pins_in_use() -> set:
+    """Collect all pins currently in pool + currently claimed (to avoid duplicates)."""
+    used = set()
+    for bp in PINS_POOL.values():
+        if bp.pin:
+            used.add(str(bp.pin).strip())
+    for _, (_, pin) in CLAIMS.items():
+        if pin:
+            used.add(str(pin).strip())
+    return used
+
+def generate_new_pin(length: int = 4, max_tries: int = 10000) -> str:
+    """
+    Generate a new numeric PIN not currently in use.
+    Default is 4 digits (0000-9999). If you ever have lots of boxes, use length=5.
+    """
+    import random
+
+    used = _all_pins_in_use()
+
+    for _ in range(max_tries):
+        pin = "".join(str(random.randint(0, 9)) for _ in range(length))
+        if pin not in used:
+            return pin
+
+    # Fallback: time-based (very unlikely to collide; we still try to avoid duplicates)
+    pin = str(int(time.time()))[-length:]
+    if pin in used:
+        pin = str(int(time.time() * 1000))[-length:]
+    return pin
+
+# -----------------------
 # Helpers: CSV
 # -----------------------
 def ensure_file_exists(path: str, headers: List[str]) -> None:
@@ -350,8 +384,9 @@ async def resetbox(interaction: discord.Interaction, box: int):
         )
         return
 
-    # Restore to pool
-    PINS_POOL[box] = BoxPin(box=box, pin=claimant_pin)
+    # ✅ FIX: Restore to pool with a NEW unique pin (NOT the old one)
+    new_pin = generate_new_pin(length=4)
+    PINS_POOL[box] = BoxPin(box=box, pin=new_pin)
     save_pins_pool(PINS_POOL)
 
     # Remove the claim (so they can claim again)
@@ -362,13 +397,13 @@ async def resetbox(interaction: discord.Interaction, box: int):
         admin_id=interaction.user.id,
         box=box,
         user_id=claimant_uid,
-        pin=claimant_pin,
-        reason="admin resetbox",
+        pin=new_pin,
+        reason=f"admin resetbox | old_pin={claimant_pin} new_pin={new_pin}",
     )
 
     await interaction.response.send_message(
         f"✅ Reset complete.\n"
-        f"Box **#{box}** has been returned to the pool with its PIN.\n"
+        f"Box **#{box}** has been returned to the pool with a NEW PIN: `{new_pin}`\n"
         f"Previous claimant user id: `{claimant_uid}`\n\n"
         f"{pool_counts()}",
         ephemeral=True
