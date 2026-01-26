@@ -125,8 +125,35 @@ def append_claim(user_id: int, box: int, pin: str) -> None:
         w = csv.writer(f)
         w.writerow([user_id, box, pin, int(time.time())])
 
+def rewrite_claims_excluding(user_id: int) -> None:
+    """Rewrite claims.csv removing all rows for a user_id (so they can claim again)."""
+    ensure_file_exists(CLAIMS_CSV_PATH, ["user_id", "box", "pin", "claimed_at"])
+    rows = []
+    with open(CLAIMS_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                uid = int(str(row.get("user_id", "")).strip())
+            except Exception:
+                continue
+            if uid != user_id:
+                rows.append(row)
+
+    with open(CLAIMS_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["user_id", "box", "pin", "claimed_at"])
+        for r in rows:
+            w.writerow([r.get("user_id", ""), r.get("box", ""), r.get("pin", ""), r.get("claimed_at", "")])
+
 def pool_counts() -> str:
     return f"Available starter kits: **{len(PINS_POOL)}**"
+
+def find_claim_by_box(box: int) -> Optional[Tuple[int, str]]:
+    """Return (user_id, pin) if that box is claimed by someone."""
+    for uid, (claimed_box, pin) in CLAIMS.items():
+        if claimed_box == box:
+            return (uid, pin)
+    return None
 
 # -----------------------
 # Boot load
@@ -161,7 +188,7 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong ✅", ephemeral=True)
 
 # -----------------------
-# ADMIN: add pins into pool (THIS is what you wanted)
+# ADMIN: add pins into pool
 # -----------------------
 @bot.tree.command(name="addpins", description="Admin: Add ONE new starter kit pin into the pool.")
 @app_commands.describe(box="Box number (e.g. 5)", pin="PIN code (e.g. 1234)")
@@ -178,20 +205,10 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
     if box in PINS_POOL:
         await interaction.response.send_message(
             f"❌ Box #{box} is already in the pool.\n"
-            f"Pick another box number, or remove it first.",
+            f"Pick another box number, or use `/resetbox` if you want to restore/reuse it.",
             ephemeral=True
         )
         return
-
-    # Also block re-adding a box that was already claimed by someone (optional safety)
-    for uid, (claimed_box, _) in CLAIMS.items():
-        if claimed_box == box:
-            await interaction.response.send_message(
-                f"❌ Box #{box} has already been claimed before (user id {uid}).\n"
-                f"Use a fresh box number.",
-                ephemeral=True
-            )
-            return
 
     # Add to in-memory pool + write to pins.csv
     PINS_POOL[box] = BoxPin(box=box, pin=pin)
@@ -225,15 +242,12 @@ async def addpinsbulk(interaction: discord.Interaction, lines: str):
             continue
 
         box = int(parts[0])
-        pin = parts[1]
-
-        if box in PINS_POOL:
+        pin = parts[1].strip()
+        if not pin:
             skipped += 1
             continue
 
-        # prevent re-using a previously claimed box
-        already_claimed = any(claimed_box == box for (claimed_box, _) in CLAIMS.values())
-        if already_claimed:
+        if box in PINS_POOL:
             skipped += 1
             continue
 
@@ -254,14 +268,72 @@ async def poolcount(interaction: discord.Interaction):
         return
     await interaction.response.send_message(pool_counts(), ephemeral=True)
 
+# ✅ NEW: reset a specific box back into the pool
+@bot.tree.command(name="resetbox", description="Admin: Restore a specific box back into the pool (reclaimable again).")
+@app_commands.describe(
+    box="Box number to restore",
+    pin="Optional: set/override the pin (leave blank to reuse pin from claim if found)"
+)
+async def resetbox(interaction: discord.Interaction, box: int, pin: Optional[str] = None):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+
+    if box in PINS_POOL:
+        await interaction.response.send_message(
+            f"⚠️ Box #{box} is already in the pool (unclaimed). Nothing changed.",
+            ephemeral=True
+        )
+        return
+
+    pin_value: Optional[str] = (pin or "").strip() if pin is not None else None
+
+    # If no pin provided, try reuse from the user who claimed that box
+    claim_info = find_claim_by_box(box)
+    claimed_user_id: Optional[int] = None
+    claimed_pin: Optional[str] = None
+    if claim_info:
+        claimed_user_id, claimed_pin = claim_info
+
+    if not pin_value:
+        if claimed_pin:
+            pin_value = claimed_pin
+        else:
+            await interaction.response.send_message(
+                f"❌ I can’t restore Box #{box} without a pin.\n"
+                f"That box is not in the pool and I couldn’t find it in claims.\n\n"
+                f"Use: `/resetbox box:{box} pin:YOURPIN`",
+                ephemeral=True
+            )
+            return
+
+    # Remove the claim so that person can claim again (if this box was claimed)
+    if claimed_user_id is not None:
+        CLAIMS.pop(claimed_user_id, None)
+        rewrite_claims_excluding(claimed_user_id)
+
+    # Put box back into pool
+    PINS_POOL[box] = BoxPin(box=box, pin=pin_value)
+    save_pins_pool(PINS_POOL)
+
+    extra = ""
+    if claimed_user_id is not None:
+        extra = f"\nRemoved claim for user id **{claimed_user_id}** so they can claim again."
+
+    await interaction.response.send_message(
+        f"✅ Restored **Box #{box}** back into the pool.\n"
+        f"**PIN:** `{pin_value}`"
+        f"{extra}\n\n"
+        f"{pool_counts()}",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="resetboxes", description="Admin: Clear ALL claims + restore pool from pins.csv only (does not rebuild deleted pins).")
 async def resetboxes(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
 
-    # This clears the CLAIMS log (so everyone can claim again)
-    # and reloads pool from whatever is currently in pins.csv
     global CLAIMS
     CLAIMS = {}
     ensure_file_exists(CLAIMS_CSV_PATH, ["user_id", "box", "pin", "claimed_at"])
@@ -271,7 +343,7 @@ async def resetboxes(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "✅ Claims cleared.\nNote: This does NOT restore pins that were removed from the pool when claimed.\n"
-        "If you need to restock, use `/addpins` or `/addpinsbulk`.",
+        "If you need to restock, use `/addpins`, `/addpinsbulk`, or `/resetbox`.",
         ephemeral=True
     )
 
@@ -308,7 +380,7 @@ async def claimstarter(interaction: discord.Interaction):
     box = sorted(PINS_POOL.keys())[0]
     bp = PINS_POOL.pop(box)
 
-    # Write pool back WITHOUT that pin (this is the “delete from system” you asked for)
+    # Write pool back WITHOUT that pin (delete from system)
     save_pins_pool(PINS_POOL)
 
     # Record claim in claims.csv + memory
@@ -325,7 +397,7 @@ async def claimstarter(interaction: discord.Interaction):
     )
 
 # -----------------------
-# POLL (basic + works)
+# POLL (updated: shows counts + updates message live)
 # -----------------------
 @dataclass
 class PollState:
@@ -337,6 +409,35 @@ class PollState:
     ended: bool
 
 POLL_BY_CHANNEL: Dict[int, PollState] = {}
+
+def poll_counts(poll: PollState) -> List[int]:
+    counts = [0] * len(poll.options)
+    for _, idx in poll.votes.items():
+        if 0 <= idx < len(counts):
+            counts[idx] += 1
+    return counts
+
+def poll_embed(poll: PollState) -> discord.Embed:
+    counts = poll_counts(poll)
+    total = sum(counts)
+
+    e = discord.Embed(title="📊 Poll", description=poll.question)
+
+    lines = []
+    for i, opt in enumerate(poll.options):
+        lines.append(f"**{i+1}.** {opt} — **{counts[i]}**")
+
+    e.add_field(
+        name=f"Options (Total votes: {total})",
+        value="\n".join(lines),
+        inline=False
+    )
+
+    if poll.ended:
+        e.set_footer(text="Poll ended.")
+    else:
+        e.set_footer(text="Click a button to vote. Admins: /pollresults /pollend /polldelete")
+    return e
 
 class PollView(discord.ui.View):
     def __init__(self, channel_id: int):
@@ -368,30 +469,31 @@ class PollView(discord.ui.View):
                 if not poll2 or poll2.ended:
                     await interaction.response.send_message("This poll is closed.", ephemeral=True)
                     return
+
                 poll2.votes[interaction.user.id] = option_index
+
+                # respond fast
                 await interaction.response.send_message(
                     f"✅ Vote saved: **{poll2.options[option_index]}**",
                     ephemeral=True
                 )
 
+                # update poll message so counts are visible
+                try:
+                    channel = interaction.client.get_channel(poll2.channel_id)
+                    if channel:
+                        msg = await channel.fetch_message(poll2.message_id)
+                        view = PollView(poll2.channel_id)
+                        view.build_buttons()
+                        await msg.edit(embed=poll_embed(poll2), view=view)
+                except Exception:
+                    pass
+
             btn.callback = callback
             self.add_item(btn)
 
-def poll_embed(poll: PollState) -> discord.Embed:
-    e = discord.Embed(title="📊 Poll", description=poll.question)
-    e.add_field(
-        name="Options",
-        value="\n".join([f"**{i+1}.** {opt}" for i, opt in enumerate(poll.options)]),
-        inline=False
-    )
-    e.set_footer(text="Click a button to vote. Admins: /pollresults /pollend /polldelete")
-    return e
-
 def poll_results_text(poll: PollState) -> str:
-    counts = [0] * len(poll.options)
-    for _, idx in poll.votes.items():
-        if 0 <= idx < len(counts):
-            counts[idx] += 1
+    counts = poll_counts(poll)
     total = sum(counts)
     out = [f"📊 **Results:** {poll.question}", f"Total votes: **{total}**"]
     for i, opt in enumerate(poll.options):
@@ -488,7 +590,16 @@ async def poll_end(interaction: discord.Interaction):
     if not poll:
         await interaction.response.send_message("No poll found in this channel.", ephemeral=True)
         return
+
     poll.ended = True
+
+    # update poll message to show ended
+    try:
+        msg = await interaction.channel.fetch_message(poll.message_id)
+        await msg.edit(embed=poll_embed(poll), view=None)
+    except Exception:
+        pass
+
     await interaction.response.send_message("✅ Poll ended. Voting is now closed.", ephemeral=True)
 
 @bot.tree.command(name="polldelete", description="Admin: Delete the poll message and remove the poll.")
