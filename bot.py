@@ -461,25 +461,42 @@ class PollView(discord.ui.View):
                     await interaction.response.send_message("This poll is closed.", ephemeral=True)
                     return
 
+                # IMPORTANT PATCH:
+                # Acknowledge the component interaction immediately (prevents timeouts),
+                # then edit the *same poll message* (no fetch needed) so counters reliably update.
+                try:
+                    await interaction.response.defer(ephemeral=True)
+                except Exception:
+                    # If already responded somehow, we’ll still try to edit + follow up.
+                    pass
+
                 # Save vote (one vote per user; changing vote is allowed)
                 poll2.votes[interaction.user.id] = option_index
 
                 # Update the public poll message so everyone sees new counters
                 try:
-                    channel = interaction.channel
-                    if channel is not None:
-                        msg = await channel.fetch_message(poll2.message_id)
-                        view = PollView(self.channel_id)
-                        view.build_buttons()
-                        await msg.edit(embed=poll_embed(poll2), view=view)
-                except Exception:
-                    # If edit fails, still save the vote and respond
-                    pass
+                    view = PollView(self.channel_id)
+                    view.build_buttons()
+                    if interaction.message is not None:
+                        await interaction.message.edit(embed=poll_embed(poll2), view=view)
+                    else:
+                        # fallback (rare): try fetching by id
+                        channel = interaction.channel
+                        if channel is not None:
+                            msg = await channel.fetch_message(poll2.message_id)
+                            await msg.edit(embed=poll_embed(poll2), view=view)
+                except Exception as e:
+                    # Don’t hide the issue completely—log it so you can see why edits fail in Railway logs.
+                    print("Poll message edit failed:", repr(e))
 
-                await interaction.response.send_message(
-                    f"✅ Vote saved: **{poll2.options[option_index]}**",
-                    ephemeral=True,
-                )
+                # Ephemeral confirmation to the voter
+                try:
+                    await interaction.followup.send(
+                        f"✅ Vote saved: **{poll2.options[option_index]}**",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
 
             btn.callback = callback
             self.add_item(btn)
