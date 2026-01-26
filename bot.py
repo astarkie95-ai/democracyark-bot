@@ -1,33 +1,30 @@
 import os
-import json
 import csv
-import threading
-from typing import List, Optional, Dict, Any
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
+
+import discord
+from discord import app_commands
+from discord.ext import commands
 
 from flask import Flask
-import discord
-from discord.ext import commands
-from dotenv import load_dotenv
+from threading import Thread
 
-load_dotenv()
+# -----------------------
+# Config / Environment
+# -----------------------
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+GUILD_ID = os.getenv("GUILD_ID", "").strip()  # optional, speeds up slash updates
+PINS_CSV_PATH = os.getenv("PINS_CSV_PATH", "pins.csv")  # default: repo root
 
-# ----------------------------
-# Config / Files
-# ----------------------------
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    # Railway logs will show this clearly if you forgot to set the variable
+    raise RuntimeError("DISCORD_TOKEN missing. Put it in Railway Variables.")
 
-PINS_CSV_PATH = os.getenv("PINS_CSV_PATH", "pins.csv")
-CLAIMS_PATH = os.getenv("CLAIMS_PATH", "claims.json")
-POLL_STORE_PATH = os.getenv("POLL_STORE_PATH", "polls.json")
-
-BOX_COUNT = int(os.getenv("BOX_COUNT", "10"))  # boxes 1..BOX_COUNT
-
-# Up to 10 options
-NUMBER_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-
-# ----------------------------
-# Flask keep-alive (Railway friendly)
-# ----------------------------
+# -----------------------
+# Tiny web server (Railway health)
+# -----------------------
 app = Flask(__name__)
 
 @app.get("/")
@@ -38,417 +35,414 @@ def run_web():
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
 
-# ----------------------------
+Thread(target=run_web, daemon=True).start()
+
+# -----------------------
 # Discord bot setup
-# ----------------------------
+# -----------------------
 intents = discord.Intents.default()
-intents.message_content = True  # needed for prefix commands
-intents.reactions = True        # needed to enforce one vote per person
-intents.guilds = True
+# We only use slash commands, so message_content not needed.
+bot = commands.Bot(command_prefix="!", intents=intents)  # prefix irrelevant, slash only
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# -----------------------
+# Starter Kit Pin Storage
+# -----------------------
+@dataclass
+class BoxPin:
+    box: int
+    pin: str
+    claimed_by: Optional[int] = None  # Discord user id if claimed
 
-# ----------------------------
-# Helpers: JSON storage
-# ----------------------------
-def _load_json(path: str, default: Any) -> Any:
+def load_pins_from_csv(path: str) -> Dict[int, BoxPin]:
+    pins: Dict[int, BoxPin] = {}
     if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+        # File missing is allowed; admin can add later, but commands will warn.
+        return pins
 
-def _save_json(path: str, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-# ----------------------------
-# Starter kit pins/claims helpers
-# ----------------------------
-def _load_claims() -> dict:
-    return _load_json(CLAIMS_PATH, {})
-
-def _save_claims(claims: dict) -> None:
-    _save_json(CLAIMS_PATH, claims)
-
-def _load_pins() -> List[str]:
-    if not os.path.exists(PINS_CSV_PATH):
-        return []
-    pins: List[str] = []
-    with open(PINS_CSV_PATH, "r", encoding="utf-8") as f:
+    with open(path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        # Expect columns: box,pin
         for row in reader:
-            p = (row.get("pin") or "").strip()
-            if p:
-                pins.append(p)
+            try:
+                box = int(str(row.get("box", "")).strip())
+                pin = str(row.get("pin", "")).strip()
+                if not pin:
+                    continue
+                pins[box] = BoxPin(box=box, pin=pin, claimed_by=None)
+            except Exception:
+                continue
     return pins
 
-def _save_pins(pins: List[str]) -> None:
-    with open(PINS_CSV_PATH, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["pin"])
-        writer.writeheader()
-        for p in pins:
-            writer.writerow({"pin": p})
+def save_pins_to_csv(path: str, pins: Dict[int, BoxPin]) -> None:
+    # Save with claimed_by in file so it persists
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["box", "pin", "claimed_by"])
+        for box in sorted(pins.keys()):
+            bp = pins[box]
+            writer.writerow([bp.box, bp.pin, bp.claimed_by if bp.claimed_by is not None else ""])
 
-def _pop_next_pin() -> Optional[str]:
-    pins = _load_pins()
-    if not pins:
-        return None
-    next_pin = pins.pop(0)
-    _save_pins(pins)
-    return next_pin
+def load_claims_if_present(path: str, pins: Dict[int, BoxPin]) -> None:
+    # If CSV includes claimed_by column, load it
+    if not os.path.exists(path):
+        return
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if "claimed_by" not in reader.fieldnames:
+            return
+        for row in reader:
+            try:
+                box = int(str(row.get("box", "")).strip())
+                claimed = str(row.get("claimed_by", "")).strip()
+                if box in pins and claimed.isdigit():
+                    pins[box].claimed_by = int(claimed)
+            except Exception:
+                continue
 
-def _get_next_available_box(claims: dict) -> Optional[int]:
-    used = set()
-    for v in claims.values():
-        try:
-            b = int(v.get("box", 0))
-            if b > 0:
-                used.add(b)
-        except Exception:
-            pass
-    for box_num in range(1, BOX_COUNT + 1):
-        if box_num not in used:
-            return box_num
+PINS: Dict[int, BoxPin] = load_pins_from_csv(PINS_CSV_PATH)
+load_claims_if_present(PINS_CSV_PATH, PINS)
+
+def get_unclaimed_boxes(pins: Dict[int, BoxPin]) -> List[BoxPin]:
+    return [bp for bp in pins.values() if bp.claimed_by is None]
+
+def find_user_claim(pins: Dict[int, BoxPin], user_id: int) -> Optional[BoxPin]:
+    for bp in pins.values():
+        if bp.claimed_by == user_id:
+            return bp
     return None
 
-# ----------------------------
-# Poll storage helpers
-# ----------------------------
-# Stored as:
-# {
-#   "<message_id>": {
-#       "guild_id": 123,
-#       "channel_id": 456,
-#       "creator_id": 789,
-#       "title": "...",
-#       "options": ["...", "..."],
-#       "emoji_map": {"1️⃣": 0, "2️⃣": 1, ...},
-#       "closed": false
-#   }
-# }
-def _load_polls() -> Dict[str, Any]:
-    return _load_json(POLL_STORE_PATH, {})
+# -----------------------
+# Poll System (Admin-only)
+# -----------------------
+@dataclass
+class PollState:
+    message_id: int
+    channel_id: int
+    question: str
+    options: List[str]
+    votes: Dict[int, int]          # user_id -> option_index
+    ended: bool
 
-def _save_polls(polls: Dict[str, Any]) -> None:
-    _save_json(POLL_STORE_PATH, polls)
+POLL_BY_CHANNEL: Dict[int, PollState] = {}  # channel_id -> poll
 
-def _is_admin(ctx: commands.Context) -> bool:
-    if not isinstance(ctx.author, discord.Member):
+class PollView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        poll = POLL_BY_CHANNEL.get(self.channel_id)
+        if not poll or poll.ended:
+            await interaction.response.send_message("This poll is closed.", ephemeral=True)
+            return False
+        return True
+
+    def build_buttons(self):
+        # Clear existing items then add buttons for current poll options
+        self.clear_items()
+        poll = POLL_BY_CHANNEL.get(self.channel_id)
+        if not poll:
+            return
+
+        for idx, label in enumerate(poll.options):
+            # Button custom_id must be stable
+            btn = discord.ui.Button(
+                label=f"{idx+1}. {label[:70]}",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"poll_vote_{self.channel_id}_{idx}"
+            )
+            async def callback(interaction: discord.Interaction, option_index=idx):
+                poll2 = POLL_BY_CHANNEL.get(self.channel_id)
+                if not poll2 or poll2.ended:
+                    await interaction.response.send_message("This poll is closed.", ephemeral=True)
+                    return
+
+                poll2.votes[interaction.user.id] = option_index
+                await interaction.response.send_message(
+                    f"✅ Vote saved: **{poll2.options[option_index]}**",
+                    ephemeral=True
+                )
+
+            btn.callback = callback
+            self.add_item(btn)
+
+def poll_embed(poll: PollState) -> discord.Embed:
+    e = discord.Embed(title="📊 Poll", description=poll.question)
+    lines = []
+    for i, opt in enumerate(poll.options):
+        lines.append(f"**{i+1}.** {opt}")
+    e.add_field(name="Options", value="\n".join(lines), inline=False)
+    e.set_footer(text="Click a button to vote. Admins can /pollresults, /pollend, /polldelete.")
+    return e
+
+def poll_results_text(poll: PollState) -> str:
+    counts = [0] * len(poll.options)
+    for _, idx in poll.votes.items():
+        if 0 <= idx < len(counts):
+            counts[idx] += 1
+    total = sum(counts)
+    out = [f"📊 **Results:** {poll.question}", f"Total votes: **{total}**"]
+    for i, opt in enumerate(poll.options):
+        out.append(f"**{i+1}. {opt}** — {counts[i]}")
+    return "\n".join(out)
+
+# -----------------------
+# Permissions helper
+# -----------------------
+def is_admin(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not interaction.user:
         return False
-    perms = ctx.author.guild_permissions
-    return perms.administrator or perms.manage_messages
+    if isinstance(interaction.user, discord.Member):
+        perms = interaction.user.guild_permissions
+        return perms.administrator or perms.manage_guild or perms.manage_channels
+    return False
 
-# ----------------------------
-# Events
-# ----------------------------
+# -----------------------
+# EVENTS
+# -----------------------
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Logged in as {bot.user} (id: {bot.user.id})")
 
-@bot.event
-async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
-    # Enforce "one vote per person" on tracked polls only
-    if user.bot:
-        return
-
-    message = reaction.message
-    polls = _load_polls()
-    poll = polls.get(str(message.id))
-    if not poll:
-        return
-
-    # If closed, remove their reaction
-    if poll.get("closed", False):
-        try:
-            await reaction.remove(user)
-        except Exception:
-            pass
-        return
-
-    emoji_str = str(reaction.emoji)
-    emoji_map = poll.get("emoji_map", {})
-    if emoji_str not in emoji_map:
-        # Not one of the poll options; remove it to keep poll clean
-        try:
-            await reaction.remove(user)
-        except Exception:
-            pass
-        return
-
-    # One vote per person: remove any other poll-option reactions from this user
+    # Sync commands
     try:
-        for r in message.reactions:
-            r_emoji = str(r.emoji)
-            if r_emoji in emoji_map and r_emoji != emoji_str:
-                await r.remove(user)
-    except Exception:
-        # If bot lacks permission to manage reactions, this won't work
-        pass
+        if GUILD_ID.isdigit():
+            guild = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} global commands")
+    except Exception as e:
+        print("Command sync failed:", e)
 
-# ----------------------------
-# Starter kit claim (PIN + BOX #)
-# ----------------------------
-@bot.command(name="claimstarter")
-async def claimstarter(ctx: commands.Context):
-    if ctx.guild is None:
-        await ctx.reply("Run this in the server, not in DMs.")
+# -----------------------
+# OLD COMMAND NAMES (RESTORED)
+# -----------------------
+@bot.tree.command(name="ping", description="Check if the bot is alive.")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong ✅", ephemeral=True)
+
+@bot.tree.command(name="addpins", description="Admin: reload pins from pins.csv (old name restored).")
+async def addpins(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
 
-    user_id = str(ctx.author.id)
-    claims = _load_claims()
+    global PINS
+    PINS = load_pins_from_csv(PINS_CSV_PATH)
+    load_claims_if_present(PINS_CSV_PATH, PINS)
 
-    if user_id in claims:
-        box = claims[user_id].get("box", "?")
-        await ctx.reply(f"You’ve already claimed your starter kit. Your box is **#{box}**. Check your DMs for the PIN.")
+    await interaction.response.send_message(
+        f"✅ Reloaded pins from `{PINS_CSV_PATH}`.\n"
+        f"Boxes loaded: **{len(PINS)}** | Unclaimed: **{len(get_unclaimed_boxes(PINS))}**",
+        ephemeral=True
+    )
+
+# -----------------------
+# STARTER KIT COMMANDS
+# -----------------------
+@bot.tree.command(name="claimstarter", description="Claim your starter kit PIN + assigned box number (one per person).")
+async def claimstarter(interaction: discord.Interaction):
+    if not interaction.user:
         return
 
-    box_num = _get_next_available_box(claims)
-    if box_num is None:
-        await ctx.reply("All starter kit boxes are currently assigned. Ask an admin to reset boxes when ready.")
-        return
-
-    pin = _pop_next_pin()
-    if not pin:
-        await ctx.reply("No starter kit PINs are available right now. Ask an admin to add more.")
-        return
-
-    claims[user_id] = {"username": str(ctx.author), "pin": pin, "box": box_num}
-    _save_claims(claims)
-
-    try:
-        await ctx.author.send(
-            f"✅ **Democracy Ark Starter Kit**\n\n"
-            f"📦 **Your box number:** **#{box_num}**\n"
-            f"🔐 **Your PIN:** **{pin}**\n\n"
-            f"Go to the Community Hub and open **Box #{box_num}** with that PIN.\n"
-            f"Keep this private."
+    if not PINS:
+        await interaction.response.send_message(
+            f"⚠️ No pins loaded yet.\nAsk an admin to create `{PINS_CSV_PATH}` and run `/addpins`.",
+            ephemeral=True
         )
-        await ctx.reply(f"✅ Check your DMs — I’ve sent your PIN and your box number (**#{box_num}**).")
-    except discord.Forbidden:
-        await ctx.reply("I can’t DM you (your DMs are closed). Please open DMs and try again.")
-
-# ----------------------------
-# Admin: pins/claims/boxes
-# ----------------------------
-@bot.command(name="addpin")
-@commands.has_permissions(administrator=True)
-async def addpin(ctx: commands.Context, pin: str):
-    pin = pin.strip()
-    if not pin:
-        await ctx.reply("Missing PIN.")
         return
-    pins = _load_pins()
-    pins.append(pin)
-    _save_pins(pins)
-    await ctx.reply(f"✅ Added PIN. Remaining unclaimed PINs: **{len(pins)}**")
 
-@bot.command(name="pinsleft")
-@commands.has_permissions(administrator=True)
-async def pinsleft(ctx: commands.Context):
-    pins = _load_pins()
-    await ctx.reply(f"📦 Remaining unclaimed PINs: **{len(pins)}**")
-
-@bot.command(name="resetclaim")
-@commands.has_permissions(administrator=True)
-async def resetclaim(ctx: commands.Context, member: discord.Member):
-    claims = _load_claims()
-    uid = str(member.id)
-    if uid not in claims:
-        await ctx.reply("That user has no claim recorded.")
+    existing = find_user_claim(PINS, interaction.user.id)
+    if existing:
+        await interaction.response.send_message(
+            f"✅ You already claimed a kit.\n"
+            f"**Your box:** #{existing.box}\n"
+            f"**Your PIN:** `{existing.pin}`",
+            ephemeral=True
+        )
         return
-    old = claims.pop(uid)
-    _save_claims(claims)
-    await ctx.reply(f"✅ Reset claim for {member.mention}. (Old PIN: {old.get('pin')} • Box: #{old.get('box')})")
 
-@bot.command(name="resetboxes")
-@commands.has_permissions(administrator=True)
-async def resetboxes(ctx: commands.Context):
-    _save_claims({})
-    await ctx.reply("✅ All starter kit boxes have been reset (all claims cleared).")
-
-@bot.command(name="boxstatus")
-@commands.has_permissions(administrator=True)
-async def boxstatus(ctx: commands.Context):
-    claims = _load_claims()
-    used = sorted({int(v.get("box", 0)) for v in claims.values() if str(v.get("box", "")).isdigit()})
-    used = [b for b in used if b > 0]
-    if not used:
-        await ctx.reply("📦 No boxes are currently assigned.")
+    free_boxes = get_unclaimed_boxes(PINS)
+    if not free_boxes:
+        await interaction.response.send_message(
+            "❌ No starter kits available right now. Ask an admin to add more boxes/pins.",
+            ephemeral=True
+        )
         return
-    await ctx.reply("📦 Assigned boxes: " + ", ".join([f"#{b}" for b in used]))
 
-# ----------------------------
-# Poll system (proper)
-# ----------------------------
-@bot.command(name="pollcreate")
-@commands.has_permissions(manage_messages=True)
-async def pollcreate(ctx: commands.Context, title: str, *options: str):
-    # admins only (Manage Messages)
+    # Pick the lowest unclaimed box
+    free_boxes.sort(key=lambda b: b.box)
+    chosen = free_boxes[0]
+    chosen.claimed_by = interaction.user.id
+
+    # Persist claim into CSV (adds claimed_by column)
+    save_pins_to_csv(PINS_CSV_PATH, PINS)
+
+    await interaction.response.send_message(
+        f"🎁 Starter kit claimed!\n"
+        f"**Your box:** #{chosen.box}\n"
+        f"**Your PIN:** `{chosen.pin}`\n\n"
+        f"Go to the Community Hub and unlock **Box #{chosen.box}** with that PIN.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="resetboxes", description="Admin: reset all starter kit claims (keeps pins, clears claimed users).")
+async def resetboxes(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+
+    if not PINS:
+        await interaction.response.send_message("⚠️ No pins loaded.", ephemeral=True)
+        return
+
+    for bp in PINS.values():
+        bp.claimed_by = None
+
+    save_pins_to_csv(PINS_CSV_PATH, PINS)
+
+    await interaction.response.send_message(
+        f"✅ All starter kit claims cleared.\n"
+        f"Boxes available now: **{len(PINS)}**",
+        ephemeral=True
+    )
+
+# -----------------------
+# POLL COMMANDS (ADMIN ONLY)
+# -----------------------
+@bot.tree.command(name="poll", description="Admin: Create a poll with up to 10 options.")
+@app_commands.describe(
+    question="The poll question",
+    option1="Option 1",
+    option2="Option 2",
+    option3="Option 3 (optional)",
+    option4="Option 4 (optional)",
+    option5="Option 5 (optional)",
+    option6="Option 6 (optional)",
+    option7="Option 7 (optional)",
+    option8="Option 8 (optional)",
+    option9="Option 9 (optional)",
+    option10="Option 10 (optional)",
+)
+async def poll_create(
+    interaction: discord.Interaction,
+    question: str,
+    option1: str,
+    option2: str,
+    option3: Optional[str] = None,
+    option4: Optional[str] = None,
+    option5: Optional[str] = None,
+    option6: Optional[str] = None,
+    option7: Optional[str] = None,
+    option8: Optional[str] = None,
+    option9: Optional[str] = None,
+    option10: Optional[str] = None,
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+    if not interaction.channel:
+        return
+
+    channel_id = interaction.channel.id
+
+    # One poll per channel (simple and clean)
+    existing = POLL_BY_CHANNEL.get(channel_id)
+    if existing and not existing.ended:
+        await interaction.response.send_message(
+            "⚠️ There is already an active poll in this channel.\n"
+            "Use `/pollend` to end it or `/polldelete` to remove it.",
+            ephemeral=True
+        )
+        return
+
+    options = [option1, option2]
+    for opt in [option3, option4, option5, option6, option7, option8, option9, option10]:
+        if opt and opt.strip():
+            options.append(opt.strip())
+
     if len(options) < 2:
-        await ctx.reply("Need at least 2 options.")
-        return
-    if len(options) > 10:
-        await ctx.reply("Max 10 options.")
+        await interaction.response.send_message("Need at least 2 options.", ephemeral=True)
         return
 
-    # build embed
-    lines: List[str] = []
-    emoji_map: Dict[str, int] = {}
-    for i, opt in enumerate(options):
-        em = NUMBER_EMOJIS[i]
-        emoji_map[em] = i
-        lines.append(f"{em} {opt}")
-
-    embed = discord.Embed(
-        title="📊 Poll",
-        description=f"**{title}**\n\n" + "\n".join(lines),
-        color=discord.Color.blurple()
+    # Build state
+    poll_state = PollState(
+        message_id=0,
+        channel_id=channel_id,
+        question=question.strip(),
+        options=options[:10],
+        votes={},
+        ended=False,
     )
-    embed.set_footer(text=f"One vote per person • Started by {ctx.author.display_name}")
+    POLL_BY_CHANNEL[channel_id] = poll_state
 
-    msg = await ctx.send(embed=embed)
+    view = PollView(channel_id=channel_id)
+    view.build_buttons()
 
-    # add reactions
-    for i in range(len(options)):
-        await msg.add_reaction(NUMBER_EMOJIS[i])
+    await interaction.response.send_message(embed=poll_embed(poll_state), view=view)
+    msg = await interaction.original_response()
+    poll_state.message_id = msg.id
 
-    # store poll
-    polls = _load_polls()
-    polls[str(msg.id)] = {
-        "guild_id": ctx.guild.id if ctx.guild else None,
-        "channel_id": ctx.channel.id,
-        "creator_id": ctx.author.id,
-        "title": title,
-        "options": list(options),
-        "emoji_map": emoji_map,
-        "closed": False
-    }
-    _save_polls(polls)
+@bot.tree.command(name="pollresults", description="Admin: Show results for the current poll in this channel.")
+async def poll_results(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+    if not interaction.channel:
+        return
 
-    await ctx.reply(f"✅ Poll created. Message ID: `{msg.id}`", mention_author=False)
-
-@bot.command(name="pollresults")
-async def pollresults(ctx: commands.Context, message_id: int):
-    polls = _load_polls()
-    poll = polls.get(str(message_id))
+    poll = POLL_BY_CHANNEL.get(interaction.channel.id)
     if not poll:
-        await ctx.reply("Poll not found.")
+        await interaction.response.send_message("No poll found in this channel.", ephemeral=True)
         return
 
-    # fetch message
-    try:
-        channel = await bot.fetch_channel(int(poll["channel_id"]))
-        msg = await channel.fetch_message(int(message_id))
-    except Exception:
-        await ctx.reply("I can’t fetch that poll message.")
+    await interaction.response.send_message(poll_results_text(poll), ephemeral=True)
+
+@bot.tree.command(name="pollend", description="Admin: End/lock the current poll (stops voting).")
+async def poll_end(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+    if not interaction.channel:
         return
 
-    emoji_map = poll.get("emoji_map", {})
-    options = poll.get("options", [])
-    counts = [0] * len(options)
-
-    # count reactions (exclude bot’s own reaction)
-    for r in msg.reactions:
-        e = str(r.emoji)
-        if e in emoji_map:
-            # r.count includes the bot's own reaction; subtract 1 if bot reacted (it did)
-            n = max(0, r.count - 1)
-            idx = int(emoji_map[e])
-            if 0 <= idx < len(counts):
-                counts[idx] = n
-
-    total = sum(counts)
-    lines = []
-    for i, opt in enumerate(options):
-        lines.append(f"{NUMBER_EMOJIS[i]} {opt} — **{counts[i]}**")
-
-    status = "CLOSED" if poll.get("closed", False) else "OPEN"
-    embed = discord.Embed(
-        title=f"📊 Poll Results ({status})",
-        description="\n".join(lines) + f"\n\nTotal votes: **{total}**",
-        color=discord.Color.green() if poll.get("closed", False) else discord.Color.blurple()
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name="pollclose")
-@commands.has_permissions(manage_messages=True)
-async def pollclose(ctx: commands.Context, message_id: int):
-    polls = _load_polls()
-    poll = polls.get(str(message_id))
+    poll = POLL_BY_CHANNEL.get(interaction.channel.id)
     if not poll:
-        await ctx.reply("Poll not found.")
+        await interaction.response.send_message("No poll found in this channel.", ephemeral=True)
         return
 
-    if poll.get("closed", False):
-        await ctx.reply("That poll is already closed.")
+    poll.ended = True
+    await interaction.response.send_message("✅ Poll ended. Voting is now closed.", ephemeral=True)
+
+@bot.tree.command(name="polldelete", description="Admin: Delete the poll message and remove the poll state.")
+async def poll_delete(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+    if not interaction.channel:
         return
 
-    # mark closed
-    poll["closed"] = True
-    polls[str(message_id)] = poll
-    _save_polls(polls)
-
-    # update poll message footer
-    try:
-        channel = await bot.fetch_channel(int(poll["channel_id"]))
-        msg = await channel.fetch_message(int(message_id))
-        if msg.embeds:
-            embed = msg.embeds[0]
-            embed.set_footer(text=f"CLOSED • One vote per person • Started by <@{poll['creator_id']}>")
-            await msg.edit(embed=embed)
-    except Exception:
-        pass
-
-    await ctx.reply("✅ Poll closed. Votes are now locked (reactions removed if people try).")
-
-@bot.command(name="polldelete")
-@commands.has_permissions(manage_messages=True)
-async def polldelete(ctx: commands.Context, message_id: int):
-    polls = _load_polls()
-    poll = polls.get(str(message_id))
+    channel_id = interaction.channel.id
+    poll = POLL_BY_CHANNEL.get(channel_id)
     if not poll:
-        await ctx.reply("Poll not found.")
+        await interaction.response.send_message("No poll found in this channel.", ephemeral=True)
         return
 
-    # delete message
+    # Try delete the poll message
     try:
-        channel = await bot.fetch_channel(int(poll["channel_id"]))
-        msg = await channel.fetch_message(int(message_id))
+        channel = interaction.channel
+        msg = await channel.fetch_message(poll.message_id)
         await msg.delete()
     except Exception:
-        # even if deletion fails, remove from storage so it's not stuck
         pass
 
-    polls.pop(str(message_id), None)
-    _save_polls(polls)
-    await ctx.reply("✅ Poll deleted.")
+    POLL_BY_CHANNEL.pop(channel_id, None)
+    await interaction.response.send_message("🗑️ Poll deleted.", ephemeral=True)
 
-@bot.command(name="polllist")
-@commands.has_permissions(manage_messages=True)
-async def polllist(ctx: commands.Context):
-    polls = _load_polls()
-    channel_id = ctx.channel.id
-    items = []
-    for mid, p in polls.items():
-        if int(p.get("channel_id", -1)) == channel_id:
-            status = "CLOSED" if p.get("closed", False) else "OPEN"
-            items.append(f"• `{mid}` — {status} — {p.get('title','(no title)')[:60]}")
-
-    if not items:
-        await ctx.reply("No tracked polls in this channel.")
-        return
-
-    await ctx.reply("\n".join(items))
-
-# ----------------------------
-# Main
-# ----------------------------
-if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN missing. Put it in Railway Variables.")
-
-    threading.Thread(target=run_web, daemon=True).start()
-    bot.run(DISCORD_TOKEN)
+# -----------------------
+# Run
+# -----------------------
+bot.run(DISCORD_TOKEN)
