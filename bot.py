@@ -263,7 +263,7 @@ async def poolcount(interaction: discord.Interaction):
     await interaction.response.send_message(pool_counts(), ephemeral=True)
 
 # -----------------------
-# ✅ NEW: ADMIN reset ONE box back into the pool
+# ✅ ADMIN reset ONE box back into the pool
 # -----------------------
 @bot.tree.command(name="resetbox", description="Admin: Put a claimed box back into the pool (restores its PIN).")
 @app_commands.describe(box="Box number to reset (e.g. 1)")
@@ -389,7 +389,7 @@ async def claimstarter(interaction: discord.Interaction):
     )
 
 # -----------------------
-# POLL (basic)
+# POLL (UPDATED: no 1.1 / 2.2, and live public vote counters)
 # -----------------------
 @dataclass
 class PollState:
@@ -397,10 +397,35 @@ class PollState:
     channel_id: int
     question: str
     options: List[str]
-    votes: Dict[int, int]
+    votes: Dict[int, int]  # user_id -> option_index
     ended: bool
 
 POLL_BY_CHANNEL: Dict[int, PollState] = {}
+
+def _poll_counts(poll: PollState) -> List[int]:
+    counts = [0] * len(poll.options)
+    for idx in poll.votes.values():
+        if 0 <= idx < len(counts):
+            counts[idx] += 1
+    return counts
+
+def poll_embed(poll: PollState) -> discord.Embed:
+    counts = _poll_counts(poll)
+    total = sum(counts)
+
+    e = discord.Embed(
+        title="📊 Poll" + (" (Closed)" if poll.ended else ""),
+        description=poll.question,
+    )
+
+    # Public, live counts
+    lines = []
+    for i, opt in enumerate(poll.options):
+        lines.append(f"**{i+1}.** {opt} — **{counts[i]}** vote(s)")
+    e.add_field(name=f"Options (Total votes: {total})", value="\n".join(lines), inline=False)
+
+    e.set_footer(text="Click a button to vote. Admins: /pollresults /pollend /polldelete")
+    return e
 
 class PollView(discord.ui.View):
     def __init__(self, channel_id: int):
@@ -420,9 +445,12 @@ class PollView(discord.ui.View):
         if not poll:
             return
 
-        for idx, label in enumerate(poll.options):
+        counts = _poll_counts(poll)
+
+        for idx in range(len(poll.options)):
+            # Button label ONLY numbers + live count (prevents 1.1 / 2.2)
             btn = discord.ui.Button(
-                label=f"{idx+1}. {label[:70]}",
+                label=f"{idx+1} ({counts[idx]})",
                 style=discord.ButtonStyle.primary,
                 custom_id=f"poll_vote_{self.channel_id}_{idx}",
             )
@@ -432,7 +460,22 @@ class PollView(discord.ui.View):
                 if not poll2 or poll2.ended:
                     await interaction.response.send_message("This poll is closed.", ephemeral=True)
                     return
+
+                # Save vote (one vote per user; changing vote is allowed)
                 poll2.votes[interaction.user.id] = option_index
+
+                # Update the public poll message so everyone sees new counters
+                try:
+                    channel = interaction.channel
+                    if channel is not None:
+                        msg = await channel.fetch_message(poll2.message_id)
+                        view = PollView(self.channel_id)
+                        view.build_buttons()
+                        await msg.edit(embed=poll_embed(poll2), view=view)
+                except Exception:
+                    # If edit fails, still save the vote and respond
+                    pass
+
                 await interaction.response.send_message(
                     f"✅ Vote saved: **{poll2.options[option_index]}**",
                     ephemeral=True,
@@ -441,21 +484,8 @@ class PollView(discord.ui.View):
             btn.callback = callback
             self.add_item(btn)
 
-def poll_embed(poll: PollState) -> discord.Embed:
-    e = discord.Embed(title="📊 Poll", description=poll.question)
-    e.add_field(
-        name="Options",
-        value="\n".join([f"**{i+1}.** {opt}" for i, opt in enumerate(poll.options)]),
-        inline=False,
-    )
-    e.set_footer(text="Click a button to vote. Admins: /pollresults /pollend /polldelete")
-    return e
-
 def poll_results_text(poll: PollState) -> str:
-    counts = [0] * len(poll.options)
-    for _, idx in poll.votes.items():
-        if 0 <= idx < len(counts):
-            counts[idx] += 1
+    counts = _poll_counts(poll)
     total = sum(counts)
     out = [f"📊 **Results:** {poll.question}", f"Total votes: **{total}**"]
     for i, opt in enumerate(poll.options):
@@ -552,6 +582,14 @@ async def poll_end(interaction: discord.Interaction):
         await interaction.response.send_message("No poll found in this channel.", ephemeral=True)
         return
     poll.ended = True
+
+    # Try to update the public message to show closed + final counts
+    try:
+        msg = await interaction.channel.fetch_message(poll.message_id)
+        await msg.edit(embed=poll_embed(poll), view=None)
+    except Exception:
+        pass
+
     await interaction.response.send_message("✅ Poll ended. Voting is now closed.", ephemeral=True)
 
 @bot.tree.command(name="polldelete", description="Admin: Delete the poll message and remove the poll.")
