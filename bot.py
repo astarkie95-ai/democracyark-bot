@@ -11,6 +11,9 @@ from discord.ext import commands
 from flask import Flask
 from threading import Thread
 
+# ✅ PATCH: used for poll edit locks
+import asyncio
+
 # -----------------------
 # ENV
 # -----------------------
@@ -402,6 +405,16 @@ class PollState:
 
 POLL_BY_CHANNEL: Dict[int, PollState] = {}
 
+# ✅ PATCH: prevents Discord dropping edits when multiple votes happen fast
+POLL_LOCKS: Dict[int, asyncio.Lock] = {}
+
+def _get_poll_lock(channel_id: int) -> asyncio.Lock:
+    lock = POLL_LOCKS.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        POLL_LOCKS[channel_id] = lock
+    return lock
+
 def _poll_counts(poll: PollState) -> List[int]:
     counts = [0] * len(poll.options)
     for idx in poll.votes.values():
@@ -461,33 +474,32 @@ class PollView(discord.ui.View):
                     await interaction.response.send_message("This poll is closed.", ephemeral=True)
                     return
 
-                # IMPORTANT PATCH:
-                # Acknowledge the component interaction immediately (prevents timeouts),
-                # then edit the *same poll message* (no fetch needed) so counters reliably update.
+                # ✅ PATCH: acknowledge instantly so Discord doesn't time out the interaction
                 try:
                     await interaction.response.defer(ephemeral=True)
                 except Exception:
-                    # If already responded somehow, we’ll still try to edit + follow up.
                     pass
 
-                # Save vote (one vote per user; changing vote is allowed)
-                poll2.votes[interaction.user.id] = option_index
+                # ✅ PATCH: serialize edits so counts always update
+                lock = _get_poll_lock(self.channel_id)
+                async with lock:
+                    # Save vote (one vote per user; changing vote is allowed)
+                    poll2.votes[interaction.user.id] = option_index
 
-                # Update the public poll message so everyone sees new counters
-                try:
-                    view = PollView(self.channel_id)
-                    view.build_buttons()
-                    if interaction.message is not None:
-                        await interaction.message.edit(embed=poll_embed(poll2), view=view)
-                    else:
-                        # fallback (rare): try fetching by id
-                        channel = interaction.channel
-                        if channel is not None:
-                            msg = await channel.fetch_message(poll2.message_id)
-                            await msg.edit(embed=poll_embed(poll2), view=view)
-                except Exception as e:
-                    # Don’t hide the issue completely—log it so you can see why edits fail in Railway logs.
-                    print("Poll message edit failed:", repr(e))
+                    # ✅ PATCH: ALWAYS edit the real poll message by ID (most reliable)
+                    try:
+                        channel = bot.get_channel(poll2.channel_id)
+                        if channel is None:
+                            channel = await bot.fetch_channel(poll2.channel_id)
+
+                        msg = await channel.fetch_message(poll2.message_id)
+
+                        view = PollView(self.channel_id)
+                        view.build_buttons()
+
+                        await msg.edit(embed=poll_embed(poll2), view=view)
+                    except Exception as e:
+                        print("Poll message edit failed:", repr(e))
 
                 # Ephemeral confirmation to the voter
                 try:
