@@ -24,6 +24,13 @@ PINS_CSV_PATH = os.getenv("PINS_CSV_PATH", "pins.csv")         # pool (unclaimed
 CLAIMS_CSV_PATH = os.getenv("CLAIMS_CSV_PATH", "claims.csv")   # state (claimed now)
 RESETS_CSV_PATH = os.getenv("RESETS_CSV_PATH", "resets.csv")   # admin reset log
 
+# ✅ NEW: channel locks for slash commands (set these in Railway Variables)
+# Copy channel ID in Discord (Developer Mode):
+# - CLAIM_CHANNEL_ID = #claim-starter-kit channel ID
+# - VOTE_CHANNEL_ID  = #vote channel ID
+CLAIM_CHANNEL_ID = os.getenv("CLAIM_CHANNEL_ID", "").strip()
+VOTE_CHANNEL_ID = os.getenv("VOTE_CHANNEL_ID", "").strip()
+
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing. Put it in Railway Variables.")
 
@@ -71,6 +78,28 @@ def is_admin(interaction: discord.Interaction) -> bool:
         p = interaction.user.guild_permissions
         return p.administrator or p.manage_guild or p.manage_channels
     return False
+
+# -----------------------
+# ✅ NEW: Helpers — enforce specific channels for commands
+# -----------------------
+def _only_in_channel(interaction: discord.Interaction, allowed_channel_id: str) -> bool:
+    """
+    Returns True if:
+      - allowed_channel_id is NOT set (fails open), or
+      - interaction is in allowed channel.
+    """
+    if not interaction.channel:
+        return False
+    if not allowed_channel_id or not allowed_channel_id.isdigit():
+        return True  # If env var missing, don't block (so bot still works)
+    return interaction.channel.id == int(allowed_channel_id)
+
+async def _wrong_channel(interaction: discord.Interaction, channel_name: str):
+    msg = f"❌ Please use this command in {channel_name}."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
 
 # -----------------------
 # Helpers: CSV
@@ -183,6 +212,11 @@ async def ping(interaction: discord.Interaction):
 @bot.tree.command(name="addpins", description="Admin: Add ONE new starter kit pin into the pool.")
 @app_commands.describe(box="Box number (e.g. 5)", pin="PIN code (e.g. 1234)")
 async def addpins(interaction: discord.Interaction, box: int, pin: str):
+    # ✅ lock starter-kit admin commands to claim channel too
+    if not _only_in_channel(interaction, CLAIM_CHANNEL_ID):
+        await _wrong_channel(interaction, "#claim-starter-kit")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -219,6 +253,11 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
 @bot.tree.command(name="addpinsbulk", description="Admin: Add MANY starter kit pins at once (one per line: box,pin).")
 @app_commands.describe(lines="Paste lines like:\n1,1234\n2,5678\n3,9012")
 async def addpinsbulk(interaction: discord.Interaction, lines: str):
+    # ✅ lock starter-kit admin commands to claim channel too
+    if not _only_in_channel(interaction, CLAIM_CHANNEL_ID):
+        await _wrong_channel(interaction, "#claim-starter-kit")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -260,6 +299,11 @@ async def addpinsbulk(interaction: discord.Interaction, lines: str):
 
 @bot.tree.command(name="poolcount", description="Admin: Show how many starter kits are available.")
 async def poolcount(interaction: discord.Interaction):
+    # ✅ lock starter-kit admin commands to claim channel too
+    if not _only_in_channel(interaction, CLAIM_CHANNEL_ID):
+        await _wrong_channel(interaction, "#claim-starter-kit")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -271,6 +315,11 @@ async def poolcount(interaction: discord.Interaction):
 @bot.tree.command(name="resetbox", description="Admin: Put a claimed box back into the pool (restores its PIN).")
 @app_commands.describe(box="Box number to reset (e.g. 1)")
 async def resetbox(interaction: discord.Interaction, box: int):
+    # ✅ lock starter-kit admin commands to claim channel too
+    if not _only_in_channel(interaction, CLAIM_CHANNEL_ID):
+        await _wrong_channel(interaction, "#claim-starter-kit")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -330,6 +379,11 @@ async def resetbox(interaction: discord.Interaction, box: int):
 # -----------------------
 @bot.tree.command(name="resetboxes", description="Admin: Clear ALL claims (everyone can claim again).")
 async def resetboxes(interaction: discord.Interaction):
+    # ✅ lock starter-kit admin commands to claim channel too
+    if not _only_in_channel(interaction, CLAIM_CHANNEL_ID):
+        await _wrong_channel(interaction, "#claim-starter-kit")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -351,6 +405,11 @@ async def resetboxes(interaction: discord.Interaction):
 @bot.tree.command(name="claimstarter", description="Claim your starter kit PIN + assigned box number (one per person).")
 async def claimstarter(interaction: discord.Interaction):
     if not interaction.user:
+        return
+
+    # ✅ lock starter-kit player command to claim channel
+    if not _only_in_channel(interaction, CLAIM_CHANNEL_ID):
+        await _wrong_channel(interaction, "#claim-starter-kit")
         return
 
     uid = interaction.user.id
@@ -549,6 +608,11 @@ async def poll_create(
     option9: Optional[str] = None,
     option10: Optional[str] = None,
 ):
+    # ✅ lock poll creation to vote channel
+    if not _only_in_channel(interaction, VOTE_CHANNEL_ID):
+        await _wrong_channel(interaction, "#vote")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -588,6 +652,11 @@ async def poll_create(
 
 @bot.tree.command(name="pollresults", description="Admin: Show results for the current poll in this channel.")
 async def poll_results(interaction: discord.Interaction):
+    # ✅ lock poll admin commands to vote channel
+    if not _only_in_channel(interaction, VOTE_CHANNEL_ID):
+        await _wrong_channel(interaction, "#vote")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -601,6 +670,11 @@ async def poll_results(interaction: discord.Interaction):
 
 @bot.tree.command(name="pollend", description="Admin: End/lock the current poll.")
 async def poll_end(interaction: discord.Interaction):
+    # ✅ lock poll admin commands to vote channel
+    if not _only_in_channel(interaction, VOTE_CHANNEL_ID):
+        await _wrong_channel(interaction, "#vote")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
@@ -623,6 +697,11 @@ async def poll_end(interaction: discord.Interaction):
 
 @bot.tree.command(name="polldelete", description="Admin: Delete the poll message and remove the poll.")
 async def poll_delete(interaction: discord.Interaction):
+    # ✅ lock poll admin commands to vote channel
+    if not _only_in_channel(interaction, VOTE_CHANNEL_ID):
+        await _wrong_channel(interaction, "#vote")
+        return
+
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
