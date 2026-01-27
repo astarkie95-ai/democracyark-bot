@@ -540,7 +540,6 @@ def _render_welcome_message(mention: str) -> str:
         template = DEFAULT_WELCOME_MESSAGE
     if "{mention}" in template:
         return template.replace("{mention}", mention)
-    return template
     return f"{template} {mention}"
 
 @bot.event
@@ -553,8 +552,8 @@ async def on_member_join(member: discord.Member):
     if channel is None:
         return
     try:
+        # ✅ Keep ONLY the custom/template message (set via /setwelcome)
         await channel.send(_render_welcome_message(member.mention))
-        await channel.send(f"Welcome to the server, {member.mention}! 🎉")
     except Exception as e:
         print("Welcome message failed:", repr(e), flush=True)
 
@@ -594,8 +593,8 @@ async def testwelcome(interaction: discord.Interaction):
         return
 
     try:
+        # ✅ Keep ONLY the custom/template message (set via /setwelcome)
         await channel.send(_render_welcome_message(interaction.user.mention))
-        await channel.send(f"Welcome to the server, {interaction.user.mention}! 🎉")
         await interaction.response.send_message("✅ Sent test welcome message.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to send welcome message: {repr(e)}", ephemeral=True)
