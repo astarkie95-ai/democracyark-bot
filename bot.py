@@ -42,9 +42,9 @@ VOTE_CHANNEL_ID = os.getenv("VOTE_CHANNEL_ID", "").strip()
 # Example: postgresql://user:pass@host/db?sslmode=require
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# ✅ FIX: show in logs whether Railway actually has DATABASE_URL
-print("BOOT: bot.py loaded")
-print("BOOT: DATABASE_URL set =", "YES" if bool(DATABASE_URL) else "NO")
+# ✅ FIX: show in logs whether Railway actually has DATABASE_URL (flush so Railway shows it immediately)
+print("BOOT: bot.py loaded", flush=True)
+print("BOOT: DATABASE_URL set =", "YES" if bool(DATABASE_URL) else "NO", flush=True)
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing. Put it in Railway Variables.")
@@ -114,19 +114,20 @@ async def db_init() -> None:
     """
     global DB_POOL
 
-    print("DB: init starting…")  # ✅ FIX: helps you see if db_init is actually running
+    # ✅ FIX: helps you see if db_init is actually running
+    print("DB: init starting…", flush=True)
 
     if not DATABASE_URL:
-        print("DATABASE_URL not set. Using CSV files (non-persistent on some hosts).")
+        print("DB: DATABASE_URL not set. Using CSV files (non-persistent on some hosts).", flush=True)
         DB_POOL = None
         return
 
     clean_url, ssl_required = _normalize_database_url(DATABASE_URL)
 
-    # ✅ FIX: asyncpg expects an SSL context (not True/False reliably)
-    ssl_ctx = None
-    if ssl_required or True:
-        ssl_ctx = ssl_lib.create_default_context()
+    # ✅ FIX: asyncpg expects an SSL context (more reliable than True/False)
+    ssl_ctx = ssl_lib.create_default_context()
+    # If you ever want to allow non-SSL locally, you'd gate ssl_ctx on ssl_required,
+    # but Neon requires SSL so we keep it always-on.
 
     try:
         DB_POOL = await asyncpg.create_pool(
@@ -136,7 +137,7 @@ async def db_init() -> None:
             max_size=5,
             command_timeout=30,
         )
-        print("✅ Connected to Postgres (Neon).")
+        print("✅ DB: Connected to Postgres (Neon).", flush=True)
 
         async with DB_POOL.acquire() as conn:
             # Create tables if they don't exist
@@ -164,9 +165,9 @@ async def db_init() -> None:
                     reason TEXT
                 );
             """)
-            print("✅ DB: tables ensured.")
+            print("✅ DB: tables ensured.", flush=True)
     except Exception as e:
-        print("❌ Postgres init failed, falling back to CSV:", repr(e))
+        print("❌ DB: Postgres init failed, falling back to CSV:", repr(e), flush=True)
         DB_POOL = None
 
 async def db_load_pins_pool() -> Dict[int, "BoxPin"]:
@@ -441,31 +442,34 @@ CLAIMS = load_claims_state()
 # -----------------------
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (id: {bot.user.id})")
+    # ✅ FIX: confirm on_ready is actually firing (flush so Railway shows it)
+    print("READY: on_ready fired", flush=True)
+
+    print(f"Logged in as {bot.user} (id: {bot.user.id})", flush=True)
 
     # ✅ NEW: init DB + load state from DB (or keep CSV fallback)
     try:
         await db_init()
     except Exception as e:
-        print("DB init exception:", repr(e))
+        print("DB init exception:", repr(e), flush=True)
 
     try:
         await load_state()
-        print(f"Loaded state: pins={len(PINS_POOL)} claims={len(CLAIMS)} (DB={'yes' if DB_POOL else 'no'})")
+        print(f"Loaded state: pins={len(PINS_POOL)} claims={len(CLAIMS)} (DB={'yes' if DB_POOL else 'no'})", flush=True)
     except Exception as e:
-        print("State load failed:", repr(e))
+        print("State load failed:", repr(e), flush=True)
 
     try:
         if GUILD_ID.isdigit():
             guild = discord.Object(id=int(GUILD_ID))
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+            print(f"Synced {len(synced)} commands to guild {GUILD_ID}", flush=True)
         else:
             synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} global commands")
+            print(f"Synced {len(synced)} global commands", flush=True)
     except Exception as e:
-        print("Command sync failed:", e)
+        print("Command sync failed:", repr(e), flush=True)
 
 # -----------------------
 # Old names (restored)
@@ -473,6 +477,26 @@ async def on_ready():
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong ✅", ephemeral=True)
+
+# -----------------------
+# ✅ FIX: DB status checker (safe, admin only)
+# -----------------------
+@bot.tree.command(name="dbstatus", description="Admin: Check database connection status.")
+async def dbstatus(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+
+    if DB_POOL is None:
+        await interaction.response.send_message("DB: ❌ Not connected (using CSV fallback).", ephemeral=True)
+        return
+
+    try:
+        async with DB_POOL.acquire() as conn:
+            v = await conn.fetchval("SELECT 1;")
+        await interaction.response.send_message(f"DB: ✅ Connected (SELECT 1 returned {v}).", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"DB: ❌ Error: {repr(e)}", ephemeral=True)
 
 # -----------------------
 # ADMIN: add pins into pool
