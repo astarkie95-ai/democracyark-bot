@@ -2,6 +2,10 @@ import os
 import csv
 import time
 import traceback
+import os
+import csv
+import time
+import traceback
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple
 
@@ -91,10 +95,34 @@ class DemocracyBot(commands.Bot):
             print("State load failed:", traceback.format_exc(), flush=True)
 
 bot = DemocracyBot(command_prefix="!", intents=intents)  # prefix irrelevant, we use slash
+intents = discord.Intents.default()
+class DemocracyBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        # ✅ FIX: ensure DB init runs during startup (before on_ready)
+        print("BOOT: setup_hook starting", flush=True)
+        try:
+            await db_init()
+        except Exception:
+            print("DB init exception:", traceback.format_exc(), flush=True)
+
+        try:
+            await load_state()
+            print(
+                f"Loaded state: pins={len(PINS_POOL)} claims={len(CLAIMS)} (DB={'yes' if DB_POOL else 'no'})",
+                flush=True,
+            )
+        except Exception:
+            print("State load failed:", traceback.format_exc(), flush=True)
+
+bot = DemocracyBot(command_prefix="!", intents=intents)  # prefix irrelevant, we use slash
 
 # -----------------------
 # ✅ NEW: Database globals
 # -----------------------
+DB_POOL: Optional[asyncpg.Pool] = None
+LAST_DB_URL: str = ""
+
+def _normalize_database_url(url: str) -> Tuple[str, bool]:
 DB_POOL: Optional[asyncpg.Pool] = None
 LAST_DB_URL: str = ""
 
@@ -112,6 +140,22 @@ def _normalize_database_url(url: str) -> Tuple[str, bool]:
     if raw and raw[0] in ("'", '"') and raw[-1] == raw[0]:
         raw = raw[1:-1]
     url = raw.strip()
+
+    # ✅ FIX: asyncpg prefers postgresql:// not postgres://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if not url:
+        return "", False
+
+    raw = url.strip()
+    if raw.lower().startswith("psql"):
+        raw = raw[len("psql"):].strip()
+    if raw and raw[0] in ("'", '"') and raw[-1] == raw[0]:
+        raw = raw[1:-1]
+    url = raw.strip()
+
+    if not url:
+        return "", False
 
     # ✅ FIX: asyncpg prefers postgresql:// not postgres://
     if url.startswith("postgres://"):
@@ -134,10 +178,59 @@ def _normalize_database_url(url: str) -> Tuple[str, bool]:
             q.pop("sslmode", None)
         if "channel_binding" in q:
             q.pop("channel_binding", None)
+        # Default to SSL unless explicitly disabled.
+        ssl_required = True
+        ssl_required = False
+        sslmode = (q.get("sslmode") or "").lower().strip()
+        if sslmode in ("require", "verify-ca", "verify-full"):
+            ssl_required = True
+        if sslmode in ("disable", "allow", "prefer"):
+            ssl_required = False
+
+        # Remove params asyncpg doesn't accept
+        if "sslmode" in q:
+            q.pop("sslmode", None)
+        if "channel_binding" in q:
+            q.pop("channel_binding", None)
+        # Remove sslmode from query params
+        if "sslmode" in q:
+            q.pop("sslmode", None)
 
         new_query = urlencode(q) if q else ""
         new_u = u._replace(query=new_query)
         return urlunparse(new_u), ssl_required
+    except Exception:
+        # If parsing fails, just return original and let connection attempt decide
+        return url, True
+
+def _sanitize_dsn(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        u = urlparse(url)
+        netloc = u.netloc
+        if "@" in netloc:
+            auth, host = netloc.split("@", 1)
+            if ":" in auth:
+                user, _ = auth.split(":", 1)
+                auth = f"{user}:***"
+            netloc = f"{auth}@{host}"
+        return urlunparse(u._replace(netloc=netloc))
+    except Exception:
+        return "<invalid dsn>"
+
+def _safe_db_info(url: str) -> Tuple[str, str]:
+    if not url:
+        return "", ""
+    try:
+        u = urlparse(url)
+        host = u.hostname or ""
+        dbname = (u.path or "").lstrip("/")
+        return host, dbname
+    except Exception:
+        return "", ""
+
+async def db_init() -> None:
     except Exception:
         # If parsing fails, just return original and let connection attempt decide
         return url, True
@@ -175,6 +268,7 @@ async def db_init() -> None:
     If DATABASE_URL isn't set, we will fall back to CSV (existing behavior).
     """
     global DB_POOL, LAST_DB_URL
+    global DB_POOL, LAST_DB_URL
 
     # ✅ FIX: helps you see if db_init is actually running
     print("DB: init starting…", flush=True)
@@ -184,6 +278,25 @@ async def db_init() -> None:
         DB_POOL = None
         return
 
+    clean_url, ssl_required = _normalize_database_url(DATABASE_URL)
+    LAST_DB_URL = clean_url
+    print("DB: normalized scheme =", urlparse(clean_url).scheme, flush=True)
+    print("DB: ssl_required =", ssl_required, flush=True)
+    print("DB: dsn =", _sanitize_dsn(clean_url), flush=True)
+
+    # ✅ FIX: asyncpg expects an SSL context (more reliable than True/False)
+    ssl_ctx = ssl_lib.create_default_context() if ssl_required else None
+
+    try:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=clean_url,
+            ssl=ssl_ctx,
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+            timeout=15,
+        )
+        print("✅ DB: Connected to Postgres (Neon).", flush=True)
     clean_url, ssl_required = _normalize_database_url(DATABASE_URL)
     LAST_DB_URL = clean_url
     print("DB: normalized scheme =", urlparse(clean_url).scheme, flush=True)
@@ -231,6 +344,13 @@ async def db_init() -> None:
                 );
             """)
             print("✅ DB: tables ensured.", flush=True)
+    except Exception:
+        print(
+            "❌ DB: Postgres init failed, falling back to CSV:\n"
+            f"{traceback.format_exc()}",
+            flush=True,
+        )
+        DB_POOL = None
     except Exception:
         print(
             "❌ DB: Postgres init failed, falling back to CSV:\n"
@@ -519,6 +639,16 @@ async def on_ready():
     try:
         if GUILD_ID.isdigit():
             guild = discord.Object(id=int(GUILD_ID))
+@bot.event
+async def on_ready():
+    # ✅ FIX: confirm on_ready is actually firing (flush so Railway shows it)
+    print("READY: on_ready fired", flush=True)
+
+    print(f"Logged in as {bot.user} (id: {bot.user.id})", flush=True)
+
+    try:
+        if GUILD_ID.isdigit():
+            guild = discord.Object(id=int(GUILD_ID))
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(synced)} commands to guild {GUILD_ID}", flush=True)
@@ -587,6 +717,43 @@ async def testwelcome(interaction: discord.Interaction):
 # ✅ FIX: DB status checker (safe, admin only)
 # -----------------------
 @bot.tree.command(name="dbstatus", description="Admin: Check database connection status.")
+async def dbstatus(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+
+    if DB_POOL is None:
+        await interaction.response.send_message("DB: ❌ Not connected (using CSV fallback).", ephemeral=True)
+        return
+
+    try:
+        async with DB_POOL.acquire() as conn:
+            v = await conn.fetchval("SELECT 1;")
+            tables = await conn.fetch(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name IN ('pins_pool', 'claims', 'resets');
+                """
+            )
+        host, dbname = _safe_db_info(LAST_DB_URL or DATABASE_URL)
+        found = {r["table_name"] for r in tables}
+        missing = sorted({"pins_pool", "claims", "resets"} - found)
+        table_line = "all present" if not missing else f"missing: {', '.join(missing)}"
+        await interaction.response.send_message(
+            "DB: ✅ Connected.\n"
+            f"Host: `{host or 'unknown'}`\n"
+            f"DB: `{dbname or 'unknown'}`\n"
+            f"Tables: {table_line}\n"
+            f"SELECT 1: {v}",
+            ephemeral=True,
+        )
+    except Exception:
+        await interaction.response.send_message(
+            f"DB: ❌ Error:\n{traceback.format_exc()}",
+            ephemeral=True,
+        )
 async def dbstatus(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
