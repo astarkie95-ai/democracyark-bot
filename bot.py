@@ -40,10 +40,16 @@ CLAIM_CHANNEL_ID = os.getenv("CLAIM_CHANNEL_ID", "").strip()
 VOTE_CHANNEL_ID = os.getenv("VOTE_CHANNEL_ID", "").strip()
 # - WELCOME_CHANNEL_ID = #welcome channel ID
 WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID", "").strip()
+WELCOME_MESSAGE_ENV = os.getenv("WELCOME_MESSAGE", "").strip()
 
 # ✅ NEW: Neon Postgres connection string (set this in Railway Variables)
 # Example: postgresql://user:pass@host/db?sslmode=require
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+DEFAULT_WELCOME_MESSAGE = (
+    "Welcome to Democracy Ark, {mention}! Please read the rules and treat others with respect."
+)
+WELCOME_MESSAGE = WELCOME_MESSAGE_ENV or DEFAULT_WELCOME_MESSAGE
 
 # ✅ FIX: show in logs whether Railway actually has DATABASE_URL (flush so Railway shows it immediately)
 print("BOOT: bot.py loaded", flush=True)
@@ -528,6 +534,14 @@ async def on_ready():
     except Exception as e:
         print("Command sync failed:", repr(e), flush=True)
 
+def _render_welcome_message(mention: str) -> str:
+    template = (WELCOME_MESSAGE or DEFAULT_WELCOME_MESSAGE).strip()
+    if not template:
+        template = DEFAULT_WELCOME_MESSAGE
+    if "{mention}" in template:
+        return template.replace("{mention}", mention)
+    return f"{template} {mention}"
+
 @bot.event
 async def on_member_join(member: discord.Member):
     if not WELCOME_CHANNEL_ID or not WELCOME_CHANNEL_ID.isdigit():
@@ -538,6 +552,7 @@ async def on_member_join(member: discord.Member):
     if channel is None:
         return
     try:
+        await channel.send(_render_welcome_message(member.mention))
         await channel.send(f"Welcome to the server, {member.mention}! 🎉")
     except Exception as e:
         print("Welcome message failed:", repr(e), flush=True)
@@ -578,10 +593,34 @@ async def testwelcome(interaction: discord.Interaction):
         return
 
     try:
+        await channel.send(_render_welcome_message(interaction.user.mention))
         await channel.send(f"Welcome to the server, {interaction.user.mention}! 🎉")
         await interaction.response.send_message("✅ Sent test welcome message.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to send welcome message: {repr(e)}", ephemeral=True)
+
+# -----------------------
+# ✅ Admin: set welcome message
+# -----------------------
+@bot.tree.command(name="setwelcome", description="Admin: Set the welcome message template.")
+@app_commands.describe(message="Message template. Use {mention} for the user mention.")
+async def setwelcome(interaction: discord.Interaction, message: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+
+    new_message = message.strip()
+    if not new_message:
+        await interaction.response.send_message("❌ Message cannot be empty.", ephemeral=True)
+        return
+
+    global WELCOME_MESSAGE
+    WELCOME_MESSAGE = new_message
+    preview = _render_welcome_message(interaction.user.mention)
+    await interaction.response.send_message(
+        "✅ Welcome message updated. Preview:\n" + preview,
+        ephemeral=True,
+    )
 
 # -----------------------
 # ✅ FIX: DB status checker (safe, admin only)
