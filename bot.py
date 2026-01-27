@@ -550,6 +550,40 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong ✅", ephemeral=True)
 
 # -----------------------
+# ✅ Admin: test welcome message
+# -----------------------
+@bot.tree.command(name="testwelcome", description="Admin: Send a test welcome message in the welcome channel.")
+async def testwelcome(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        return
+
+    if not WELCOME_CHANNEL_ID or not WELCOME_CHANNEL_ID.isdigit():
+        await interaction.response.send_message(
+            "❌ WELCOME_CHANNEL_ID is not set or invalid.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+        return
+
+    channel = interaction.guild.get_channel(int(WELCOME_CHANNEL_ID))
+    if channel is None:
+        await interaction.response.send_message(
+            "❌ Welcome channel not found. Check WELCOME_CHANNEL_ID.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await channel.send(f"Welcome to the server, {interaction.user.mention}! 🎉")
+        await interaction.response.send_message("✅ Sent test welcome message.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to send welcome message: {repr(e)}", ephemeral=True)
+
+# -----------------------
 # ✅ FIX: DB status checker (safe, admin only)
 # -----------------------
 @bot.tree.command(name="dbstatus", description="Admin: Check database connection status.")
