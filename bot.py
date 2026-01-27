@@ -14,6 +14,10 @@ from threading import Thread
 # ✅ PATCH: used for poll edit locks
 import asyncio
 
+# ✅ NEW: database (Neon Postgres)
+import asyncpg
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
 # -----------------------
 # ENV
 # -----------------------
@@ -30,6 +34,10 @@ RESETS_CSV_PATH = os.getenv("RESETS_CSV_PATH", "resets.csv")   # admin reset log
 # - VOTE_CHANNEL_ID  = #vote channel ID
 CLAIM_CHANNEL_ID = os.getenv("CLAIM_CHANNEL_ID", "").strip()
 VOTE_CHANNEL_ID = os.getenv("VOTE_CHANNEL_ID", "").strip()
+
+# ✅ NEW: Neon Postgres connection string (set this in Railway Variables)
+# Example: postgresql://user:pass@host/db?sslmode=require
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing. Put it in Railway Variables.")
@@ -54,6 +62,168 @@ Thread(target=run_web, daemon=True).start()
 # -----------------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)  # prefix irrelevant, we use slash
+
+# -----------------------
+# ✅ NEW: Database globals
+# -----------------------
+DB_POOL: Optional[asyncpg.Pool] = None
+
+def _normalize_database_url(url: str) -> Tuple[str, bool]:
+    """
+    Neon often provides ?sslmode=require. asyncpg doesn't accept sslmode in the URL.
+    We strip sslmode from the URL and return whether SSL should be enabled.
+    """
+    if not url:
+        return "", False
+
+    try:
+        u = urlparse(url)
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+
+        ssl_required = False
+        sslmode = (q.get("sslmode") or "").lower().strip()
+        if sslmode in ("require", "verify-ca", "verify-full"):
+            ssl_required = True
+
+        # Remove sslmode from query params
+        if "sslmode" in q:
+            q.pop("sslmode", None)
+
+        new_query = urlencode(q) if q else ""
+        new_u = u._replace(query=new_query)
+        return urlunparse(new_u), ssl_required
+    except Exception:
+        # If parsing fails, just return original and let connection attempt decide
+        return url, True
+
+async def db_init() -> None:
+    """
+    Create pool + ensure tables exist.
+    If DATABASE_URL isn't set, we will fall back to CSV (existing behavior).
+    """
+    global DB_POOL
+
+    if not DATABASE_URL:
+        print("DATABASE_URL not set. Using CSV files (non-persistent on some hosts).")
+        DB_POOL = None
+        return
+
+    clean_url, ssl_required = _normalize_database_url(DATABASE_URL)
+    try:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=clean_url,
+            ssl=ssl_required or True,  # Neon requires SSL; this keeps it safe.
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+        )
+        print("✅ Connected to Postgres (Neon).")
+
+        async with DB_POOL.acquire() as conn:
+            # Create tables if they don't exist
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS pins_pool (
+                    box INTEGER PRIMARY KEY,
+                    pin TEXT NOT NULL
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS claims (
+                    user_id BIGINT PRIMARY KEY,
+                    box INTEGER NOT NULL UNIQUE,
+                    pin TEXT NOT NULL,
+                    claimed_at BIGINT NOT NULL
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS resets (
+                    reset_at BIGINT NOT NULL,
+                    admin_id BIGINT NOT NULL,
+                    box INTEGER NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    pin TEXT NOT NULL,
+                    reason TEXT
+                );
+            """)
+    except Exception as e:
+        print("❌ Postgres init failed, falling back to CSV:", repr(e))
+        DB_POOL = None
+
+async def db_load_pins_pool() -> Dict[int, "BoxPin"]:
+    pool: Dict[int, BoxPin] = {}
+    if DB_POOL is None:
+        return pool
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT box, pin FROM pins_pool;")
+        for r in rows:
+            try:
+                b = int(r["box"])
+                p = str(r["pin"]).strip()
+                if p:
+                    pool[b] = BoxPin(box=b, pin=p)
+            except Exception:
+                continue
+    return pool
+
+async def db_save_pins_pool(pool: Dict[int, "BoxPin"]) -> None:
+    if DB_POOL is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("TRUNCATE TABLE pins_pool;")
+            for box in sorted(pool.keys()):
+                await conn.execute(
+                    "INSERT INTO pins_pool (box, pin) VALUES ($1, $2);",
+                    int(box),
+                    str(pool[box].pin),
+                )
+
+async def db_load_claims_state() -> Dict[int, Tuple[int, str]]:
+    claims: Dict[int, Tuple[int, str]] = {}
+    if DB_POOL is None:
+        return claims
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, box, pin FROM claims;")
+        for r in rows:
+            try:
+                uid = int(r["user_id"])
+                box = int(r["box"])
+                pin = str(r["pin"]).strip()
+                if uid and pin:
+                    claims[uid] = (box, pin)
+            except Exception:
+                continue
+    return claims
+
+async def db_save_claims_state(claims: Dict[int, Tuple[int, str]]) -> None:
+    if DB_POOL is None:
+        return
+    now = int(time.time())
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("TRUNCATE TABLE claims;")
+            for uid, (box, pin) in sorted(claims.items(), key=lambda x: x[0]):
+                await conn.execute(
+                    "INSERT INTO claims (user_id, box, pin, claimed_at) VALUES ($1, $2, $3, $4);",
+                    int(uid),
+                    int(box),
+                    str(pin),
+                    now,
+                )
+
+async def db_append_reset_log(admin_id: int, box: int, user_id: int, pin: str, reason: str = "") -> None:
+    if DB_POOL is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO resets (reset_at, admin_id, box, user_id, pin, reason) VALUES ($1,$2,$3,$4,$5,$6);",
+            int(time.time()),
+            int(admin_id),
+            int(box),
+            int(user_id),
+            str(pin),
+            str(reason) if reason is not None else "",
+        )
 
 # -----------------------
 # Data models
@@ -209,7 +379,39 @@ def pool_counts() -> str:
     return f"Available starter kits: **{len(PINS_POOL)}**"
 
 # -----------------------
-# Boot load
+# ✅ NEW: persistence wrappers (DB preferred, CSV fallback)
+# -----------------------
+async def load_state() -> None:
+    global PINS_POOL, CLAIMS
+    if DB_POOL is not None:
+        PINS_POOL = await db_load_pins_pool()
+        CLAIMS = await db_load_claims_state()
+        return
+
+    # Fallback to CSV
+    PINS_POOL = load_pins_pool()
+    CLAIMS = load_claims_state()
+
+async def save_pool_state() -> None:
+    if DB_POOL is not None:
+        await db_save_pins_pool(PINS_POOL)
+    else:
+        save_pins_pool(PINS_POOL)
+
+async def save_claims_only() -> None:
+    if DB_POOL is not None:
+        await db_save_claims_state(CLAIMS)
+    else:
+        save_claims_state(CLAIMS)
+
+async def log_reset(admin_id: int, box: int, user_id: int, pin: str, reason: str = "") -> None:
+    if DB_POOL is not None:
+        await db_append_reset_log(admin_id, box, user_id, pin, reason)
+    else:
+        append_reset_log(admin_id, box, user_id, pin, reason)
+
+# -----------------------
+# Boot load (CSV fallback will be used until DB is ready)
 # -----------------------
 PINS_POOL = load_pins_pool()
 CLAIMS = load_claims_state()
@@ -220,6 +422,18 @@ CLAIMS = load_claims_state()
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
+
+    # ✅ NEW: init DB + load state from DB (or keep CSV fallback)
+    try:
+        await db_init()
+    except Exception as e:
+        print("DB init exception:", repr(e))
+
+    try:
+        await load_state()
+        print(f"Loaded state: pins={len(PINS_POOL)} claims={len(CLAIMS)} (DB={'yes' if DB_POOL else 'no'})")
+    except Exception as e:
+        print("State load failed:", repr(e))
 
     try:
         if GUILD_ID.isdigit():
@@ -277,7 +491,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
             return
 
     PINS_POOL[box] = BoxPin(box=box, pin=pin)
-    save_pins_pool(PINS_POOL)
+    await save_pool_state()
 
     await interaction.response.send_message(
         f"✅ Added starter kit to pool.\n**Box:** #{box}\n**PIN:** `{pin}`\n\n{pool_counts()}",
@@ -324,7 +538,7 @@ async def addpinsbulk(interaction: discord.Interaction, lines: str):
         PINS_POOL[box] = BoxPin(box=box, pin=pin)
         added += 1
 
-    save_pins_pool(PINS_POOL)
+    await save_pool_state()
 
     await interaction.response.send_message(
         f"✅ Bulk add complete.\nAdded: **{added}** | Skipped: **{skipped}**\n\n{pool_counts()}",
@@ -387,13 +601,13 @@ async def resetbox(interaction: discord.Interaction, box: int):
     # ✅ FIX: Restore to pool with a NEW unique pin (NOT the old one)
     new_pin = generate_new_pin(length=4)
     PINS_POOL[box] = BoxPin(box=box, pin=new_pin)
-    save_pins_pool(PINS_POOL)
+    await save_pool_state()
 
     # Remove the claim (so they can claim again)
     CLAIMS.pop(claimant_uid, None)
-    save_claims_state(CLAIMS)
+    await save_claims_only()
 
-    append_reset_log(
+    await log_reset(
         admin_id=interaction.user.id,
         box=box,
         user_id=claimant_uid,
@@ -425,7 +639,7 @@ async def resetboxes(interaction: discord.Interaction):
 
     global CLAIMS
     CLAIMS = {}
-    save_claims_state(CLAIMS)
+    await save_claims_only()
 
     await interaction.response.send_message(
         "✅ Claims cleared.\n"
@@ -470,11 +684,11 @@ async def claimstarter(interaction: discord.Interaction):
     bp = PINS_POOL.pop(box)
 
     # Persist pool change
-    save_pins_pool(PINS_POOL)
+    await save_pool_state()
 
     # Record claim in state
     CLAIMS[uid] = (bp.box, bp.pin)
-    save_claims_state(CLAIMS)
+    await save_claims_only()
 
     await interaction.response.send_message(
         f"🎁 Starter kit claimed!\n"
