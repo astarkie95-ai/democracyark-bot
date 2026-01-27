@@ -540,6 +540,7 @@ def _render_welcome_message(mention: str) -> str:
         template = DEFAULT_WELCOME_MESSAGE
     if "{mention}" in template:
         return template.replace("{mention}", mention)
+    return template
     return f"{template} {mention}"
 
 @bot.event
