@@ -103,6 +103,16 @@ def _normalize_database_url(url: str) -> Tuple[str, bool]:
     if not url:
         return "", False
 
+    raw = url.strip()
+    if raw.lower().startswith("psql"):
+        raw = raw[len("psql"):].strip()
+    if raw and raw[0] in ("'", '"') and raw[-1] == raw[0]:
+        raw = raw[1:-1]
+    url = raw.strip()
+
+    if not url:
+        return "", False
+
     # ✅ FIX: asyncpg prefers postgresql:// not postgres://
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
@@ -111,6 +121,8 @@ def _normalize_database_url(url: str) -> Tuple[str, bool]:
         u = urlparse(url)
         q = dict(parse_qsl(u.query, keep_blank_values=True))
 
+        # Default to SSL unless explicitly disabled.
+        ssl_required = True
         ssl_required = False
         sslmode = (q.get("sslmode") or "").lower().strip()
         if sslmode in ("require", "verify-ca", "verify-full"):
@@ -118,6 +130,11 @@ def _normalize_database_url(url: str) -> Tuple[str, bool]:
         if sslmode in ("disable", "allow", "prefer"):
             ssl_required = False
 
+        # Remove params asyncpg doesn't accept
+        if "sslmode" in q:
+            q.pop("sslmode", None)
+        if "channel_binding" in q:
+            q.pop("channel_binding", None)
         # Remove sslmode from query params
         if "sslmode" in q:
             q.pop("sslmode", None)
