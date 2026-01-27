@@ -18,6 +18,9 @@ import asyncio
 import asyncpg
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
+# ✅ FIX: proper SSL handling for asyncpg / Neon
+import ssl as ssl_lib
+
 # -----------------------
 # ENV
 # -----------------------
@@ -38,6 +41,10 @@ VOTE_CHANNEL_ID = os.getenv("VOTE_CHANNEL_ID", "").strip()
 # ✅ NEW: Neon Postgres connection string (set this in Railway Variables)
 # Example: postgresql://user:pass@host/db?sslmode=require
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# ✅ FIX: show in logs whether Railway actually has DATABASE_URL
+print("BOOT: bot.py loaded")
+print("BOOT: DATABASE_URL set =", "YES" if bool(DATABASE_URL) else "NO")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing. Put it in Railway Variables.")
@@ -76,6 +83,10 @@ def _normalize_database_url(url: str) -> Tuple[str, bool]:
     if not url:
         return "", False
 
+    # ✅ FIX: asyncpg prefers postgresql:// not postgres://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+
     try:
         u = urlparse(url)
         q = dict(parse_qsl(u.query, keep_blank_values=True))
@@ -103,16 +114,24 @@ async def db_init() -> None:
     """
     global DB_POOL
 
+    print("DB: init starting…")  # ✅ FIX: helps you see if db_init is actually running
+
     if not DATABASE_URL:
         print("DATABASE_URL not set. Using CSV files (non-persistent on some hosts).")
         DB_POOL = None
         return
 
     clean_url, ssl_required = _normalize_database_url(DATABASE_URL)
+
+    # ✅ FIX: asyncpg expects an SSL context (not True/False reliably)
+    ssl_ctx = None
+    if ssl_required or True:
+        ssl_ctx = ssl_lib.create_default_context()
+
     try:
         DB_POOL = await asyncpg.create_pool(
             dsn=clean_url,
-            ssl=ssl_required or True,  # Neon requires SSL; this keeps it safe.
+            ssl=ssl_ctx,
             min_size=1,
             max_size=5,
             command_timeout=30,
@@ -145,6 +164,7 @@ async def db_init() -> None:
                     reason TEXT
                 );
             """)
+            print("✅ DB: tables ensured.")
     except Exception as e:
         print("❌ Postgres init failed, falling back to CSV:", repr(e))
         DB_POOL = None
