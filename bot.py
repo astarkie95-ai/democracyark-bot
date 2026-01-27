@@ -553,6 +553,7 @@ async def on_member_join(member: discord.Member):
         return
     try:
         await channel.send(_render_welcome_message(member.mention))
+        await channel.send(f"Welcome to the server, {member.mention}! 🎉")
     except Exception as e:
         print("Welcome message failed:", repr(e), flush=True)
 
@@ -593,6 +594,7 @@ async def testwelcome(interaction: discord.Interaction):
 
     try:
         await channel.send(_render_welcome_message(interaction.user.mention))
+        await channel.send(f"Welcome to the server, {interaction.user.mention}! 🎉")
         await interaction.response.send_message("✅ Sent test welcome message.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to send welcome message: {repr(e)}", ephemeral=True)
