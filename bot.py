@@ -104,11 +104,11 @@ def _normalize_database_url(url: str) -> Tuple[str, bool]:
         return "", False
 
     raw = url.strip()
-    if raw.startswith("psql "):
-        raw = raw[len("psql "):].strip()
-    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+    if raw.lower().startswith("psql"):
+        raw = raw[len("psql"):].strip()
+    if raw and raw[0] in ("'", '"') and raw[-1] == raw[0]:
         raw = raw[1:-1]
-    url = raw
+    url = raw.strip()
 
     # ✅ FIX: asyncpg prefers postgresql:// not postgres://
     if url.startswith("postgres://"):
