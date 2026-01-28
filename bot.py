@@ -83,6 +83,11 @@ SERVER_PING_ROLE_IDS = os.getenv(
     "1461514415559147725,1461514871396106404,1461515030800629915,1465022269456646336",
 ).strip()
 
+
+# ✅ NEW: ping mode
+# If SERVER_PING_EVERYONE is truthy, alerts will use @everyone (restricted to channel visibility).
+SERVER_PING_EVERYONE = os.getenv("SERVER_PING_EVERYONE", "0").strip().lower() in ("1","true","yes","on")
+
 # Back-compat (optional): single role id or role names (not recommended)
 SERVER_PING_ROLE_ID = os.getenv("SERVER_PING_ROLE_ID", "").strip()
 SERVER_PING_ROLE_NAMES = os.getenv("SERVER_PING_ROLE_NAMES", "").strip()
@@ -492,7 +497,14 @@ def _parse_id_list(s: str) -> List[int]:
     return uniq
 
 def _build_server_ping(guild: discord.Guild) -> str:
-    """Return a ping string for server alerts (role mentions), or empty string."""
+    """Return a ping string for server alerts, or empty string.
+
+    If SERVER_PING_EVERYONE is enabled, returns "@everyone ".
+    Otherwise returns role mentions based on SERVER_PING_ROLE_IDS.
+    """
+    if SERVER_PING_EVERYONE:
+        return "@everyone "
+
     role_ids: List[int] = _parse_id_list(SERVER_PING_ROLE_IDS)
 
     # Back-compat: single role id
@@ -517,6 +529,17 @@ def _build_server_ping(guild: discord.Guild) -> str:
                 mentions.append(role.mention)
 
     return (" ".join(mentions) + " ") if mentions else ""
+
+def _alert_allowed_mentions() -> discord.AllowedMentions:
+    """Allowed mentions for alerts (prevents accidental broad pings).
+
+    - If SERVER_PING_EVERYONE: allow @everyone only.
+    - Else: allow role mentions only.
+    """
+    if SERVER_PING_EVERYONE:
+        return discord.AllowedMentions(everyone=True, roles=False, users=False, replied_user=False)
+    return discord.AllowedMentions(everyone=False, roles=True, users=False, replied_user=False)
+
 # =====================================================================
 # ✅ NEW: Nitrado restart system (Owners-only) - /restartdemocracy
 # =====================================================================
@@ -919,7 +942,7 @@ async def _announce_restart(guild: discord.Guild, message: str, requester: Optio
     e.timestamp = datetime.utcnow()
 
     try:
-        await ch.send(content=ping, embed=e)
+        await ch.send(content=ping, embed=e, allowed_mentions=_alert_allowed_mentions())
     except Exception:
         pass
 
@@ -961,7 +984,7 @@ async def _announce_status_change(guild: discord.Guild, old_raw: str, new_raw: s
         msg = f"{ping}Server status changed: **{old_state} → {new_state}**"
 
     try:
-        await ch.send(msg)
+        await ch.send(msg, allowed_mentions=_alert_allowed_mentions())
         _STATUS_LAST_ANNOUNCE_AT = now
     except Exception:
         pass
@@ -1235,7 +1258,7 @@ async def _announce_server_action(guild: discord.Guild, action: str, message: st
     e.timestamp = datetime.utcnow()
 
     try:
-        await ch.send(content=ping, embed=e)
+        await ch.send(content=ping, embed=e, allowed_mentions=_alert_allowed_mentions())
     except Exception:
         pass
 # -----------------------
