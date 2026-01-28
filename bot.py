@@ -5,12 +5,13 @@ import traceback
 import io
 import re
 import random
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple, Set, Any
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import aiohttp  # ✅ NEW: Nitrado API calls
 
@@ -68,6 +69,20 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 NITRADO_TOKEN = os.getenv("NITRADO_TOKEN", "").strip()
 NITRADO_SERVICE_ID = os.getenv("NITRADO_SERVICE_ID", "").strip()  # e.g. 18512293
 RESTART_LOG_CHANNEL_ID = os.getenv("RESTART_LOG_CHANNEL_ID", "").strip()
+
+# ✅ NEW: Nitrado live status module + offline/online alerts
+SERVER_STATUS_CHANNEL_ID = os.getenv("SERVER_STATUS_CHANNEL_ID", "1465902095327821845").strip()# #server-status channel id
+SERVER_STATUS_MESSAGE_ID = os.getenv("SERVER_STATUS_MESSAGE_ID", "").strip()     # message id to keep editing (optional)
+SERVER_ANNOUNCE_CHANNEL_ID = os.getenv("SERVER_ANNOUNCE_CHANNEL_ID", "").strip() # (legacy) alerts channel id (optional)
+SERVER_ALERTS_CHANNEL_ID = os.getenv("SERVER_ALERTS_CHANNEL_ID", "1465903053461786698").strip()# dedicated alerts channel id (optional)
+SERVER_PING_ROLE_ID = os.getenv("SERVER_PING_ROLE_ID", "").strip()               # role id to ping (optional)
+SERVER_PING_ROLE_NAMES = os.getenv("SERVER_PING_ROLE_NAMES", "").strip()          # optional: comma-separated role names to ping
+
+# (Optional) Set SERVER_ALERTS_CHANNEL_ID to post status change alerts to a dedicated channel.
+
+
+# Status poll interval in seconds (default 60)
+NITRADO_STATUS_POLL_SECONDS = os.getenv("NITRADO_STATUS_POLL_SECONDS", "60").strip()
 
 # Owners role (ONLY this role can use /restartdemocracy)
 # You can override this in Railway by setting OWNERS_ROLE_ID, otherwise it uses your saved ID.
@@ -504,10 +519,53 @@ async def nitrado_restart_call() -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Request failed: {repr(e)}"
 
-class RestartConfirmView(discord.ui.View):
+class RestartMessageModal(discord.ui.Modal, title="Restart Democracy Ark"):
+    restart_message = discord.ui.TextInput(
+        label="Restart announcement message",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1000,
+        placeholder="e.g. Restarting in 2 minutes — please log out safely!",
+    )
+
     def __init__(self, requester_id: int):
+        super().__init__()
+        self.requester_id = requester_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Only the requester can use this modal response flow
+        if not interaction.guild or not interaction.user:
+            try:
+                await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        msg = str(self.restart_message.value or "").strip()
+        if not msg:
+            msg = "Restarting soon — please log out safely!"
+
+        view = RestartConfirmView(requester_id=self.requester_id, announcement=msg)
+
+        # Show a preview + confirm buttons (keeps your safety confirm step)
+        try:
+            await interaction.response.send_message(
+                "⚠️ **Restart Democracy Ark now?**\n"
+                "This will reboot the server via Nitrado and kick players.\n\n"
+                f"**Announcement preview:**\n> {msg[:800]}\n\n"
+                "Press **Confirm restart** to proceed.",
+                view=view,
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+
+class RestartConfirmView(discord.ui.View):
+    def __init__(self, requester_id: int, announcement: str):
         super().__init__(timeout=30)
         self.requester_id = requester_id
+        self.announcement = (announcement or "").strip()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Only the person who ran the command can confirm/cancel
@@ -515,7 +573,7 @@ class RestartConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Confirm restart", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
-        global _last_restart_at
+        global _last_restart_at, _LAST_MANUAL_RESTART
 
         now = int(time.time())
         if now - _last_restart_at < RESTART_COOLDOWN_SECONDS:
@@ -532,9 +590,26 @@ class RestartConfirmView(discord.ui.View):
         except Exception:
             pass
 
+        # ✅ NEW: Announce restart publicly (optional)
+        try:
+            if interaction.guild:
+                await _announce_restart(interaction.guild, self.announcement, interaction.user)
+        except Exception:
+            pass
+
         ok, msg = await nitrado_restart_call()
         if ok:
             _last_restart_at = now
+
+            # record for the status module (so it can show last manual restart)
+            if interaction.user:
+                _LAST_MANUAL_RESTART = {
+                    "at": int(time.time()),
+                    "by_id": int(interaction.user.id),
+                    "by_name": str(interaction.user),
+                    "message": self.announcement,
+                }
+
             try:
                 await interaction.followup.send("🔄 **Restart requested.** Nitrado will reboot the server shortly.", ephemeral=True)
             except Exception:
@@ -558,6 +633,481 @@ class RestartConfirmView(discord.ui.View):
         except Exception:
             pass
 
+
+# =====================================================================
+# ✅ NEW: Nitrado Status + Scheduled Warnings (server-status module)
+# =====================================================================
+
+_STATUS_TASKS_STARTED: bool = False
+_STATUS_LAST_RAW: str = ""
+_STATUS_LAST_ANNOUNCE_AT: int = 0
+_LAST_MANUAL_RESTART: Optional[Dict[str, Any]] = None
+_STATUS_MESSAGE_ID_RUNTIME: int = int(SERVER_STATUS_MESSAGE_ID) if _is_digit_id(SERVER_STATUS_MESSAGE_ID) else 0
+
+def _primary_guild() -> Optional[discord.Guild]:
+    if GUILD_ID and GUILD_ID.isdigit():
+        return bot.get_guild(int(GUILD_ID))
+    if bot.guilds:
+        return bot.guilds[0]
+    return None
+
+def _status_badge(raw: str) -> str:
+    raw = (raw or "").lower().strip()
+    if raw in ("started", "running", "online"):
+        return "🟢 ONLINE"
+    if raw in ("restarting", "starting", "stopping"):
+        return "🟠 RESTARTING"
+    if raw in ("stopped", "offline"):
+        return "🔴 OFFLINE"
+    return "⚪ UNKNOWN"
+
+async def _get_text_channel(guild: discord.Guild, channel_id_str: str) -> Optional[discord.TextChannel]:
+    if not _is_digit_id(channel_id_str):
+        return None
+    ch = guild.get_channel(int(channel_id_str))
+    if isinstance(ch, discord.TextChannel):
+        return ch
+    try:
+        fetched = await bot.fetch_channel(int(channel_id_str))
+        return fetched if isinstance(fetched, discord.TextChannel) else None
+    except Exception:
+        return None
+
+async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
+    """
+    Fetch gameserver status via Nitrado API.
+    Returns: (ok, payload)
+    """
+    if not NITRADO_TOKEN or not _is_digit_id(NITRADO_SERVICE_ID):
+        return False, {"error": "Nitrado not configured (NITRADO_TOKEN / NITRADO_SERVICE_ID)."}
+    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers"
+    headers = {"Authorization": f"Bearer {NITRADO_TOKEN}", "Accept": "application/json"}
+
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.get(url) as resp:
+                data = await resp.json(content_type=None)
+
+        # Nitrado's response nesting can vary; try to be defensive:
+        gs = {}
+        if isinstance(data, dict):
+            gs = (((data.get("data") or {}).get("gameserver")) or ((data.get("data") or {}).get("game_server")) or (data.get("data") or {})) or {}
+        query = gs.get("query") if isinstance(gs, dict) else None
+        if not isinstance(query, dict):
+            query = {}
+
+        status_raw = str(gs.get("status") or "unknown").lower().strip() if isinstance(gs, dict) else "unknown"
+        hostname = (gs.get("hostname") if isinstance(gs, dict) else None) or (query.get("hostname") if isinstance(query, dict) else None)
+        game = (gs.get("game") if isinstance(gs, dict) else None) or (gs.get("game_short") if isinstance(gs, dict) else None)
+        map_name = (gs.get("map") if isinstance(gs, dict) else None) or (query.get("map") if isinstance(query, dict) else None)
+        ip = (gs.get("ip") if isinstance(gs, dict) else None) or (query.get("ip") if isinstance(query, dict) else None)
+        port = (gs.get("port") if isinstance(gs, dict) else None) or (query.get("port") if isinstance(query, dict) else None)
+
+        players = query.get("player_current") or query.get("players")
+        slots = query.get("player_max") or query.get("slots")
+
+        # coerce
+        def _to_int(x):
+            try:
+                return int(x)
+            except Exception:
+                return None
+
+        payload = {
+            "status": status_raw,
+            "hostname": str(hostname) if hostname else None,
+            "game": str(game) if game else None,
+            "map": str(map_name) if map_name else None,
+            "ip": str(ip) if ip else None,
+            "port": _to_int(port),
+            "players": _to_int(players),
+            "slots": _to_int(slots),
+        }
+        return True, payload
+    except Exception as e:
+        return False, {"error": repr(e)}
+
+def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
+    badge = _status_badge(str(payload.get("status") or "unknown"))
+    now_utc = datetime.utcnow()
+
+    module = (
+        "```ansi\n"
+        "⟦ DEMOCRACY ARK : LIVE SERVER MODULE ⟧\n"
+        f"Status   : {badge}\n"
+        f"Host     : {payload.get('hostname') or '—'}\n"
+        f"Game     : {payload.get('game') or '—'}\n"
+        f"Map      : {payload.get('map') or '—'}\n"
+        f"Players  : {(payload.get('players') if payload.get('players') is not None else '—')}/{(payload.get('slots') if payload.get('slots') is not None else '—')}\n"
+        f"Address  : {(payload.get('ip') or '—')}{(':' + str(payload.get('port'))) if payload.get('port') else ''}\n"
+        f"Checked  : {now_utc.strftime('%Y-%m-%d %H:%M:%SZ')}\n"
+        "```"
+    )
+
+    e = discord.Embed(
+        title="📡 Democracy Bot — Nitrado Server Status",
+        description=module,
+    )
+
+    if _LAST_MANUAL_RESTART:
+        try:
+            at = int(_LAST_MANUAL_RESTART.get("at") or 0)
+            by_id = int(_LAST_MANUAL_RESTART.get("by_id") or 0)
+            msg = str(_LAST_MANUAL_RESTART.get("message") or "")
+            when = datetime.fromtimestamp(at, tz=timezone.utc) if at else None
+            if when and by_id:
+                e.add_field(
+                    name="🔁 Last manual restart",
+                    value=f"<@{by_id}> — {discord.utils.format_dt(when, style='R')}\n> {msg[:200]}",
+                    inline=False,
+                )
+        except Exception:
+            pass
+
+    return e
+
+async def _ensure_status_message(guild: discord.Guild) -> Optional[discord.Message]:
+    global _STATUS_MESSAGE_ID_RUNTIME
+
+    ch = await _get_text_channel(guild, SERVER_STATUS_CHANNEL_ID)
+    if not ch:
+        return None
+
+    if _STATUS_MESSAGE_ID_RUNTIME:
+        try:
+            return await ch.fetch_message(int(_STATUS_MESSAGE_ID_RUNTIME))
+        except Exception:
+            pass
+
+    # create new module message
+    try:
+        msg = await ch.send(embed=discord.Embed(title="📡 Democracy Bot — Starting up…"))
+        _STATUS_MESSAGE_ID_RUNTIME = msg.id
+        print(f"[NITRADO] New SERVER_STATUS_MESSAGE_ID = {msg.id} (save this in Railway Variables)", flush=True)
+        return msg
+    except Exception:
+        return None
+
+async def _announce_restart(guild: discord.Guild, message: str, requester: Optional[discord.abc.User]) -> None:
+    # Announce channel: prefer SERVER_ANNOUNCE_CHANNEL_ID, fallback to SERVER_STATUS_CHANNEL_ID
+    announce_id = SERVER_ANNOUNCE_CHANNEL_ID if _is_digit_id(SERVER_ANNOUNCE_CHANNEL_ID) else SERVER_STATUS_CHANNEL_ID
+    ch = await _get_text_channel(guild, announce_id)
+    if not ch:
+        return
+
+    ping = _build_server_ping(guild)
+
+    e = discord.Embed(
+        title="🔁 Server Restart",
+        description=(message or "Restarting soon — please log out safely!"),
+    )
+    if requester:
+        e.add_field(name="Requested by", value=f"{requester.mention} (`{requester.id}`)", inline=False)
+    e.timestamp = datetime.utcnow()
+
+    try:
+        await ch.send(content=ping, embed=e)
+    except Exception:
+        pass
+
+async def _announce_status_change(guild: discord.Guild, old_raw: str, new_raw: str) -> None:
+    """Post a human-friendly alert when the server is going offline/online.
+
+    Note: without a known schedule, we can't warn minutes *before* a Nitrado restart —
+    we announce as soon as the API reports a transition to stopping/restarting/offline.
+    """
+    global _STATUS_LAST_ANNOUNCE_AT
+
+    old_state = _status_badge(old_raw)
+    new_state = _status_badge(new_raw)
+
+    # Only announce when the badge meaningfully changes
+    if old_state == new_state:
+        return
+
+    now = int(time.time())
+    if now - _STATUS_LAST_ANNOUNCE_AT < 120:
+        return  # anti-spam (2 mins)
+
+    # Prefer a dedicated alerts channel if set, otherwise fallback to the status channel
+    alerts_id = SERVER_ALERTS_CHANNEL_ID if _is_digit_id(SERVER_ALERTS_CHANNEL_ID) else (
+        SERVER_ANNOUNCE_CHANNEL_ID if _is_digit_id(SERVER_ANNOUNCE_CHANNEL_ID) else SERVER_STATUS_CHANNEL_ID
+    )
+    ch = await _get_text_channel(guild, alerts_id)
+    if not ch:
+        return
+
+    ping = _build_server_ping(guild)
+
+    # Special messaging for the common cases you care about
+    if old_state == "🟢 ONLINE" and new_state in ("🟠 RESTARTING", "🔴 OFFLINE"):
+        msg = f"{ping}⚠️ **Server is going offline** ({new_state}). This usually means a Nitrado restart/shutdown has started."
+    elif new_state == "🟢 ONLINE" and old_state in ("🟠 RESTARTING", "🔴 OFFLINE"):
+        msg = f"{ping}✅ **Server is back online**."
+    else:
+        msg = f"{ping}Server status changed: **{old_state} → {new_state}**"
+
+    try:
+        await ch.send(msg)
+        _STATUS_LAST_ANNOUNCE_AT = now
+    except Exception:
+        pass
+
+@tasks.loop(seconds=60)
+async def nitrado_status_loop():
+    global _STATUS_LAST_RAW
+
+    # Allow changing interval via env var on next deploy
+    guild = _primary_guild()
+    if not guild:
+        return
+    if not _is_digit_id(SERVER_STATUS_CHANNEL_ID):
+        return
+
+    ok, payload = await nitrado_status_call()
+    if not ok:
+        payload = payload or {}
+        msg = await _ensure_status_message(guild)
+        if msg:
+            await msg.edit(
+                embed=discord.Embed(
+                    title="📡 Democracy Bot — Nitrado Server Status",
+                    description=f"```ansi\n⟦ STATUS TEMPORARILY UNAVAILABLE ⟧\nError: {payload.get('error','unknown')}\n```",
+                )
+            )
+        return
+
+    # update status module
+    msg = await _ensure_status_message(guild)
+    if msg:
+        await msg.edit(embed=_build_status_embed(payload))
+
+    new_raw = str(payload.get("status") or "unknown").lower().strip()
+    if _STATUS_LAST_RAW and new_raw != _STATUS_LAST_RAW:
+        # Announce meaningful transitions
+        await _announce_status_change(guild, _STATUS_LAST_RAW, new_raw)
+    _STATUS_LAST_RAW = new_raw
+
+@nitrado_status_loop.before_loop
+async def _before_nitrado_status_loop():
+    await bot.wait_until_ready()
+
+def start_nitrado_status_tasks() -> None:
+    global _STATUS_TASKS_STARTED
+
+    if _STATUS_TASKS_STARTED:
+        return
+    _STATUS_TASKS_STARTED = True
+
+    # Apply dynamic poll interval if set
+    try:
+        sec = int(NITRADO_STATUS_POLL_SECONDS) if str(NITRADO_STATUS_POLL_SECONDS).isdigit() else 60
+    except Exception:
+        sec = 60
+
+    # tasks.loop interval is fixed at decoration time; if user changed env, we keep 60 until redeploy.
+    # (We still read NITRADO_STATUS_POLL_SECONDS for future code changes; leave simple/stable.)
+    try:
+        if not nitrado_status_loop.is_running():
+            nitrado_status_loop.start()
+        print("NITRADO: status task started", flush=True)
+    except Exception:
+        print("NITRADO: failed to start tasks:", traceback.format_exc(), flush=True)
+
+
+
+
+# -----------------------
+# ✅ NEW: Server Control Panel (Start / Stop / Restart + message)
+# -----------------------
+
+class ServerActionModal(discord.ui.Modal):
+    def __init__(self, requester_id: int, action: str):
+        title = {
+            "start": "Start Democracy Ark",
+            "stop": "Stop Democracy Ark",
+            "restart": "Restart Democracy Ark",
+        }.get(action, "Server Action")
+        super().__init__(title=title)
+        self.requester_id = requester_id
+        self.action = action
+
+        self.message = discord.ui.TextInput(
+            label="Announcement message",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+            placeholder="e.g. Restarting now — please log out safely!",
+        )
+        self.add_item(self.message)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not interaction.user:
+            try:
+                await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        if interaction.user.id != self.requester_id:
+            try:
+                await interaction.response.send_message("❌ Only the requester can use this form.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        msg = str(self.message.value or "").strip()
+        if not msg:
+            msg = "Server action incoming."
+
+        view = ServerActionConfirmView(requester_id=self.requester_id, action=self.action, announcement=msg)
+        try:
+            await interaction.response.send_message(
+                f"⚠️ **Confirm {self.action.upper()}?**\n\n"
+                f"**Announcement preview:**\n> {msg[:800]}",
+                ephemeral=True,
+                view=view,
+            )
+        except Exception:
+            pass
+
+class ServerActionConfirmView(discord.ui.View):
+    def __init__(self, requester_id: int, action: str, announcement: str):
+        super().__init__(timeout=30)
+        self.requester_id = requester_id
+        self.action = action
+        self.announcement = (announcement or "").strip()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return bool(interaction.user and interaction.user.id == self.requester_id)
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.guild or not interaction.user or not isinstance(interaction.user, discord.Member):
+            try:
+                await interaction.response.edit_message(content="❌ Server context required.", view=None)
+            except Exception:
+                pass
+            return
+
+        if not is_staff_member(interaction.user):
+            try:
+                await interaction.response.edit_message(content="❌ Staff only.", view=None)
+            except Exception:
+                pass
+            return
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        # Announce publicly in server-alerts (or fallback)
+        try:
+            await _announce_server_action(interaction.guild, self.action, self.announcement, interaction.user)
+        except Exception:
+            pass
+
+        # Call Nitrado action
+        if self.action == "start":
+            ok, msg = await nitrado_start_call()
+        elif self.action == "stop":
+            ok, msg = await nitrado_stop_call()
+        else:
+            ok, msg = await nitrado_restart_call()
+
+        # Log it (if configured)
+        try:
+            await _restart_log(interaction.guild, f"{self.action.upper()} by {interaction.user} ({interaction.user.id}) — {msg}")
+        except Exception:
+            pass
+
+        # Disable buttons
+        try:
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    child.disabled = True
+            await interaction.edit_original_response(
+                content=("✅ Action triggered." if ok else "❌ Action failed.") + f" {msg}",
+                view=self,
+            )
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.edit_message(content="Cancelled.", view=None)
+        except Exception:
+            pass
+
+class ServerControlView(discord.ui.View):
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return bool(interaction.user and interaction.user.id == self.requester_id)
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success)
+    async def start_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(ServerActionModal(requester_id=self.requester_id, action="start"))
+        except Exception as e:
+            try:
+                await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.secondary)
+    async def stop_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(ServerActionModal(requester_id=self.requester_id, action="stop"))
+        except Exception as e:
+            try:
+                await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Restart", style=discord.ButtonStyle.danger)
+    async def restart_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(ServerActionModal(requester_id=self.requester_id, action="restart"))
+        except Exception as e:
+            try:
+                await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+            except Exception:
+                pass
+
+async def _announce_server_action(guild: discord.Guild, action: str, message: str, requester: Optional[discord.Member] = None) -> None:
+    # Alerts channel preference: SERVER_ALERTS_CHANNEL_ID -> legacy SERVER_ANNOUNCE_CHANNEL_ID -> status channel
+    alerts_id = SERVER_ALERTS_CHANNEL_ID if _is_digit_id(SERVER_ALERTS_CHANNEL_ID) else (
+        SERVER_ANNOUNCE_CHANNEL_ID if _is_digit_id(SERVER_ANNOUNCE_CHANNEL_ID) else SERVER_STATUS_CHANNEL_ID
+    )
+    ch = await _get_text_channel(guild, alerts_id)
+    if not ch:
+        return
+
+    ping = _build_server_ping(guild)
+
+    title = {
+        "start": "🟢 Server Start",
+        "stop": "🛑 Server Stop",
+        "restart": "🔁 Server Restart",
+    }.get(action, "🛠 Server Action")
+
+    e = discord.Embed(
+        title=title,
+        description=(message or "Server action incoming."),
+    )
+    if requester:
+        e.add_field(name="Requested by", value=f"{requester.mention} (`{requester.id}`)", inline=False)
+    e.timestamp = datetime.utcnow()
+
+    try:
+        await ch.send(content=ping, embed=e)
+    except Exception:
+        pass
 # -----------------------
 # ✅ NEW: Helpers — enforce specific channels for commands
 # -----------------------
@@ -747,6 +1297,12 @@ async def on_ready():
     except Exception as e:
         print("Command sync failed:", repr(e), flush=True)
 
+    # ✅ NEW: start Nitrado status/warn tasks (server-status module)
+    try:
+        start_nitrado_status_tasks()
+    except Exception:
+        print("NITRADO: start tasks failed:", traceback.format_exc(), flush=True)
+
 def _render_welcome_message(mention: str) -> str:
     template = (WELCOME_MESSAGE or DEFAULT_WELCOME_MESSAGE).strip()
     if not template:
@@ -790,14 +1346,41 @@ async def restartdemocracy(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Owners only.", ephemeral=True)
         return
 
-    view = RestartConfirmView(requester_id=interaction.user.id)
-    await interaction.response.send_message(
-        "⚠️ **Restart Democracy Ark now?**\n"
-        "This will reboot the server via Nitrado and kick players.\n\n"
-        "Press **Confirm restart** to proceed.",
-        view=view,
-        ephemeral=True,
+    # ✅ NEW: modal popup to set the restart announcement message
+    try:
+        await interaction.response.send_modal(RestartMessageModal(requester_id=interaction.user.id))
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Couldn't open the restart form: {repr(e)}", ephemeral=True)
+
+
+@bot.tree.command(name="serverpanel", description="Staff: Start/Stop/Restart the Nitrado server with an announcement.")
+async def serverpanel(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+        return
+
+    if not is_staff_member(interaction.user):
+        await interaction.response.send_message("❌ Staff only (Owner/Admin/Moderator).", ephemeral=True)
+        return
+
+    view = ServerControlView(requester_id=interaction.user.id)
+    e = discord.Embed(
+        title="🛠 Democracy Bot — Server Control Panel",
+        description=(
+            "Choose an action below. You will be asked for an announcement message, then asked to confirm.\n\n"
+            "Actions:\n"
+            "• **Start** — boots the server\n"
+            "• **Stop** — shuts the server down\n"
+            "• **Restart** — restarts the server"
+        ),
     )
+    try:
+        await interaction.response.send_message(embed=e, ephemeral=True, view=view)
+    except Exception:
+        try:
+            await interaction.response.send_message("❌ Could not open panel.", ephemeral=True)
+        except Exception:
+            pass
 
 # -----------------------
 # ✅ Admin: test welcome message
