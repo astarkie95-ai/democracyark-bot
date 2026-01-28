@@ -1771,6 +1771,32 @@ async def starter_add_vault(vault_number: int, pin: str):
     return True, f"✅ Added Vault #{vault} to the pool."
 
 
+
+def _format_starter_claims_preview(guild: Optional[discord.Guild] = None, limit: int = 25) -> str:
+    """Return a short, readable preview list of claims."""
+    if not CLAIMS:
+        return "No one has claimed a starter vault yet."
+    lines = []
+    i = 0
+    for uid, (vault, pin) in CLAIMS.items():
+        i += 1
+        if i > limit:
+            break
+        name = f"<@{uid}>"
+        # If we can resolve a member name, use it (nice, but optional)
+        if guild:
+            try:
+                member = guild.get_member(int(uid))
+                if member:
+                    name = f"{member.display_name} (<@{uid}>)"
+            except Exception:
+                pass
+        lines.append(f"{i}. {name} — Vault #{vault}")
+    more = ""
+    if len(CLAIMS) > limit:
+        more = f"\n…plus {len(CLAIMS) - limit} more."
+    return "\n".join(lines) + more
+
 async def starter_delete_vault(vault_number: int):
     try:
         vault = int(vault_number)
@@ -1841,6 +1867,15 @@ class StarterKitAdminPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(StarterDeleteVaultModal())
 
+
+    @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starteradmin_viewclaims")
+    async def viewclaims_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not is_owner_or_admin(interaction):
+            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
+            return
+        preview = _format_starter_claims_preview(interaction.guild, limit=30)
+        await interaction.response.send_message(f"**Starter vault claims ({len(CLAIMS)} total):**\n{preview}", ephemeral=True)
+
     @discord.ui.button(label="Pool Count", style=discord.ButtonStyle.secondary, custom_id="starteradmin_poolcount")
     async def poolcount_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not is_owner_or_admin(interaction):
@@ -1855,12 +1890,22 @@ async def _ensure_panel_message(
     embed: discord.Embed,
     view: discord.ui.View,
     pin: bool = False,
+    expected_embed_title: Optional[str] = None,
+    scan_limit: int = 50,
 ) -> Optional[int]:
-    """Generic helper used by module panels."""
+    """Generic helper used by module panels.
+
+    Reuse logic (prevents duplicates after redeploy/restart):
+    1) If a stored message id exists (runtime/env), fetch + edit.
+    2) Else, scan pinned messages (if pin=True) and recent history for a message from the bot whose
+       first embed title matches expected_embed_title, then edit in place.
+    3) Else, send a new message, optionally pin, and return its id.
+    """
     ch = await _get_text_channel(guild, channel_id_str)
     if not ch:
         return None
 
+    # 1) Try explicit stored id first
     current_id = globals().get(message_id_runtime_name, 0) or 0
     if current_id:
         try:
@@ -1870,6 +1915,47 @@ async def _ensure_panel_message(
         except Exception:
             pass
 
+    # 2) Scan for an existing panel (prevents duplicate panels on redeploy)
+    if expected_embed_title:
+        try:
+            # Prefer pinned messages if we intend to pin
+            if pin:
+                try:
+                    pinned = await ch.pins()
+                except Exception:
+                    pinned = []
+                for pm in pinned:
+                    try:
+                        if pm.author and pm.author.id == guild.me.id and pm.embeds:
+                            e0 = pm.embeds[0]
+                            if getattr(e0, "title", None) == expected_embed_title:
+                                await pm.edit(embed=embed, view=view)
+                                globals()[message_id_runtime_name] = int(pm.id)
+                                return int(pm.id)
+                    except Exception:
+                        continue
+
+            # Recent history scan
+            async for hm in ch.history(limit=max(10, min(int(scan_limit), 200))):
+                try:
+                    if hm.author and hm.author.id == guild.me.id and hm.embeds:
+                        e0 = hm.embeds[0]
+                        if getattr(e0, "title", None) == expected_embed_title:
+                            await hm.edit(embed=embed, view=view)
+                            globals()[message_id_runtime_name] = int(hm.id)
+                            # Optionally pin if requested
+                            if pin:
+                                try:
+                                    await hm.pin(reason="Democracy Bot: module panel")
+                                except Exception:
+                                    pass
+                            return int(hm.id)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # 3) Create a new panel message
     try:
         msg = await ch.send(embed=embed, view=view)
         if pin:
@@ -1877,6 +1963,7 @@ async def _ensure_panel_message(
                 await msg.pin(reason="Democracy Bot: module panel")
             except Exception:
                 pass
+        globals()[message_id_runtime_name] = int(msg.id)
         return int(msg.id)
     except Exception:
         return None
@@ -1900,6 +1987,7 @@ async def ensure_starter_panel(guild: discord.Guild) -> None:
         embed=_build_starter_panel_embed(),
         view=StarterKitPanelView(),
         pin=STARTER_PANEL_PIN,
+        expected_embed_title="🎁 Democracy Bot — Starter Kit Module",
     )
     if msg_id and msg_id != _STARTER_PANEL_MESSAGE_ID_RUNTIME:
         _STARTER_PANEL_MESSAGE_ID_RUNTIME = msg_id
@@ -2136,6 +2224,7 @@ async def ensure_poll_panel(guild: discord.Guild) -> None:
         embed=_build_poll_panel_embed(active if active and not active.ended else None),
         view=PersistentPollPanelView(),
         pin=POLL_PANEL_PIN,
+        expected_embed_title="🗳️ Democracy Bot — Polls",
     )
     if msg_id and msg_id != _POLL_PANEL_MESSAGE_ID_RUNTIME:
         _POLL_PANEL_MESSAGE_ID_RUNTIME = msg_id
