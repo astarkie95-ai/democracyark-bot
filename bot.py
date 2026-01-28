@@ -961,47 +961,83 @@ async def _get_text_channel(guild: discord.Guild, channel_id_str: str) -> Option
     except Exception:
         return None
 
+
 async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
-    """
-    Fetch gameserver status via Nitrado API.
+    """Fetch gameserver status via Nitrado API.
+
     Returns: (ok, payload)
+    Payload keys used by the status module:
+      status, hostname, game, map, ip, port, players, slots, provider
     """
     if not NITRADO_TOKEN or not _is_digit_id(NITRADO_SERVICE_ID):
         return False, {"error": "Nitrado not configured (NITRADO_TOKEN / NITRADO_SERVICE_ID)."}
+
     url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers"
     headers = {"Authorization": f"Bearer {NITRADO_TOKEN}", "Accept": "application/json"}
 
+    def _to_int(x):
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    def _pick(d: Dict[str, Any], keys: List[str]) -> Any:
+        for k in keys:
+            if k in d and d.get(k) not in (None, "", []):
+                return d.get(k)
+        return None
+
+    def _deep_find_gameserver(obj: Any) -> Dict[str, Any]:
+        # Try to locate a dict that looks like the gameserver payload
+        if isinstance(obj, dict):
+            # Common nesting patterns
+            for key in ("gameserver", "game_server", "gameservers", "gameServers"):
+                if key in obj:
+                    sub = obj.get(key)
+                    found = _deep_find_gameserver(sub)
+                    if found:
+                        return found
+            # Heuristic: has status and/or query and/or ip/port
+            if any(k in obj for k in ("status", "query", "ip", "port", "hostname", "map", "game")):
+                return obj
+            # Recurse into values
+            for v in obj.values():
+                found = _deep_find_gameserver(v)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _deep_find_gameserver(item)
+                if found:
+                    return found
+        return {}
+
     try:
-        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as session:
             async with session.get(url) as resp:
                 data = await resp.json(content_type=None)
 
-        # Nitrado's response nesting can vary; try to be defensive:
-        gs = {}
-        if isinstance(data, dict):
-            gs = (((data.get("data") or {}).get("gameserver")) or ((data.get("data") or {}).get("game_server")) or (data.get("data") or {})) or {}
+        # Defensive extraction across different Nitrado response shapes
+        root = data.get("data") if isinstance(data, dict) else data
+        gs = _deep_find_gameserver(root) or {}
+
         query = gs.get("query") if isinstance(gs, dict) else None
         if not isinstance(query, dict):
             query = {}
 
-        status_raw = str(gs.get("status") or "unknown").lower().strip() if isinstance(gs, dict) else "unknown"
-        hostname = (gs.get("hostname") if isinstance(gs, dict) else None) or (query.get("hostname") if isinstance(query, dict) else None)
-        game = (gs.get("game") if isinstance(gs, dict) else None) or (gs.get("game_short") if isinstance(gs, dict) else None)
-        map_name = (gs.get("map") if isinstance(gs, dict) else None) or (query.get("map") if isinstance(query, dict) else None)
-        ip = (gs.get("ip") if isinstance(gs, dict) else None) or (query.get("ip") if isinstance(query, dict) else None)
-        port = (gs.get("port") if isinstance(gs, dict) else None) or (query.get("port") if isinstance(query, dict) else None)
+        status_raw = str(gs.get("status") or query.get("status") or "unknown").lower().strip()
 
-        players = query.get("player_current") or query.get("players")
-        slots = query.get("player_max") or query.get("slots")
+        hostname = _pick(gs, ["hostname", "server_name", "name"]) or _pick(query, ["hostname", "server_name", "name"])
+        game = _pick(gs, ["game", "game_short", "game_name"]) or _pick(query, ["game", "game_short", "game_name"])
+        map_name = _pick(gs, ["map", "map_name", "mapname", "level", "world"]) or _pick(query, ["map", "map_name", "mapname", "level", "world"])
+        ip = _pick(gs, ["ip", "host", "address"]) or _pick(query, ["ip", "host", "address"])
+        port = _pick(gs, ["port", "gameport", "port_game"]) or _pick(query, ["port", "gameport", "port_game", "query_port"])
 
-        # coerce
-        def _to_int(x):
-            try:
-                return int(x)
-            except Exception:
-                return None
+        players = _pick(query, ["player_current", "players", "players_online", "current_players", "numplayers", "playerCount"])
+        slots = _pick(query, ["player_max", "slots", "players_max", "maxplayers", "playerLimit", "maxPlayers"])
 
         payload = {
+            "provider": "Nitrado",
             "status": status_raw,
             "hostname": str(hostname) if hostname else None,
             "game": str(game) if game else None,
@@ -1013,7 +1049,8 @@ async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
         }
         return True, payload
     except Exception as e:
-        return False, {"error": repr(e)}
+        return False, {"error": repr(e), "provider": "Nitrado"}
+
 
 def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
     badge = _status_badge(str(payload.get("status") or "unknown"))
@@ -1022,7 +1059,7 @@ def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
     module = (
         "```ansi\n"
         "⟦ DEMOCRACY ARK : LIVE SERVER MODULE ⟧\n"
-        f"Status   : {badge}\n"
+        f"Status   : {badge}\n"f"Provider : {payload.get('provider') or '—'}\n"
         f"Host     : {payload.get('hostname') or '—'}\n"
         f"Game     : {payload.get('game') or '—'}\n"
         f"Map      : {payload.get('map') or '—'}\n"
@@ -1600,6 +1637,27 @@ def _poll_panel_channel_id() -> str:
 def _poll_vote_channel_id() -> str:
     """Where polls are actually posted and voted on (defaults to VOTE_CHANNEL_ID)."""
     return VOTE_CHANNEL_ID if _is_digit_id(VOTE_CHANNEL_ID) else _poll_panel_channel_id()
+
+def _poll_panel_channel_id_for_guild(guild: discord.Guild) -> str:
+    """Resolve where the Poll MODULE PANEL message lives.
+
+    Priority:
+    1) POLL_PANEL_CHANNEL_ID env (explicit)
+    2) A channel named 'create-poll' (recommended staff channel)
+    3) VOTE_CHANNEL_ID fallback
+    """
+    if _is_digit_id(POLL_PANEL_CHANNEL_ID):
+        return POLL_PANEL_CHANNEL_ID
+    # Try by name so you don't have to set an env var
+    try:
+        found = _find_text_channel_id_by_name(guild, "create-poll")
+        if found:
+            return str(found)
+    except Exception:
+        pass
+    return VOTE_CHANNEL_ID
+
+
 
 def _build_starter_panel_embed() -> discord.Embed:
     lines = [
@@ -2212,7 +2270,7 @@ class PersistentPollPanelView(discord.ui.View):
 async def ensure_poll_panel(guild: discord.Guild) -> None:
     global _POLL_PANEL_MESSAGE_ID_RUNTIME
 
-    ch_id = _poll_panel_channel_id()
+    ch_id = _poll_panel_channel_id_for_guild(guild)
     if not _is_digit_id(ch_id):
         return
 
@@ -2276,7 +2334,7 @@ async def refresh_poll_panel(guild: discord.Guild, vote_channel_id: int) -> None
     global _POLL_PANEL_MESSAGE_ID_RUNTIME
     if not _POLL_PANEL_MESSAGE_ID_RUNTIME:
         return
-    ch_id = _poll_panel_channel_id()
+    ch_id = _poll_panel_channel_id_for_guild(guild)
     ch = await _get_text_channel(guild, ch_id)
     if not ch:
         return
