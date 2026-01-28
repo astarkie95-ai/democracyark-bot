@@ -92,6 +92,12 @@ POLL_PANEL_CHANNEL_ID = os.getenv("POLL_PANEL_CHANNEL_ID", "").strip()
 POLL_PANEL_MESSAGE_ID = os.getenv("POLL_PANEL_MESSAGE_ID", "").strip()
 POLL_PANEL_PIN = os.getenv("POLL_PANEL_PIN", "1").strip().lower() in ("1","true","yes","on")
 
+
+# ✅ NEW: Poll module channels split (optional)
+# - POLL_CREATE_CHANNEL_ID: where the Poll PANEL lives (private staff channel, e.g. #create-poll)
+# - POLL_VOTE_CHANNEL_ID  : where polls are posted for players to vote (public, e.g. #vote)
+POLL_CREATE_CHANNEL_ID = os.getenv("POLL_CREATE_CHANNEL_ID", "").strip()
+POLL_VOTE_CHANNEL_ID = os.getenv("POLL_VOTE_CHANNEL_ID", "").strip()
 # ✅ NEW: ping roles (use IDs, not names)
 # Default pings: Owner/Admin/Moderator/Members (you can override in Railway)
 SERVER_PING_ROLE_IDS = os.getenv(
@@ -1555,16 +1561,24 @@ def _starter_panel_channel_id() -> str:
     return STARTER_PANEL_CHANNEL_ID if _is_digit_id(STARTER_PANEL_CHANNEL_ID) else CLAIM_CHANNEL_ID
 
 def _poll_panel_channel_id() -> str:
-    """Where the Poll MODULE PANEL message lives."""
-    return POLL_PANEL_CHANNEL_ID if _is_digit_id(POLL_PANEL_CHANNEL_ID) else VOTE_CHANNEL_ID
+    """Where the Poll MODULE PANEL message lives (staff/private by default)."""
+    # Prefer explicit create channel, then POLL_PANEL_CHANNEL_ID, then fall back to VOTE_CHANNEL_ID (last resort).
+    if _is_digit_id(POLL_CREATE_CHANNEL_ID):
+        return POLL_CREATE_CHANNEL_ID
+    if _is_digit_id(POLL_PANEL_CHANNEL_ID):
+        return POLL_PANEL_CHANNEL_ID
+    return VOTE_CHANNEL_ID
 
 def _poll_vote_channel_id() -> str:
-    """Where polls are actually posted and voted on (defaults to VOTE_CHANNEL_ID)."""
-    return VOTE_CHANNEL_ID if _is_digit_id(VOTE_CHANNEL_ID) else _poll_panel_channel_id()
+    """Where polls are posted and voted on (public by default)."""
+    # Prefer explicit vote channel, then VOTE_CHANNEL_ID.
+    if _is_digit_id(POLL_VOTE_CHANNEL_ID):
+        return POLL_VOTE_CHANNEL_ID
+    return VOTE_CHANNEL_ID
 
 def _build_starter_panel_embed() -> discord.Embed:
     lines = [
-        "🎁 Claim your starter kit without commands.",
+        "🎁 Starter kits are available here.",
         "",
         f"Available kits : {len(PINS_POOL)}",
         "One per person : enabled",
@@ -1699,8 +1713,15 @@ async def _ensure_panel_message(
     embed: discord.Embed,
     view: discord.ui.View,
     pin: bool = False,
+    expected_embed_title: Optional[str] = None,
 ) -> Optional[int]:
-    """Generic helper used by module panels."""
+    """Generic helper used by module panels.
+
+    Strategy:
+    1) If message id is known (Railway var / runtime), edit it.
+    2) Else try to locate an existing pinned/recent panel by embed title (avoids duplicates on restart).
+    3) Else send a new one (and optionally pin it).
+    """
     ch = await _get_text_channel(guild, channel_id_str)
     if not ch:
         return None
@@ -1711,6 +1732,38 @@ async def _ensure_panel_message(
             msg = await ch.fetch_message(int(current_id))
             await msg.edit(embed=embed, view=view)
             return int(msg.id)
+        except Exception:
+            pass
+
+    # Try to reuse an existing pinned/recent panel to avoid duplicates (even if Railway message id isn't set)
+    title = expected_embed_title or (embed.title or "")
+    if title:
+        # 1) Pinned messages
+        try:
+            pins = await ch.pins()
+            for m in pins:
+                if not m.embeds:
+                    continue
+                if m.embeds[0].title == title and (m.author.id == getattr(bot.user, "id", m.author.id) or m.author.bot):
+                    try:
+                        await m.edit(embed=embed, view=view)
+                        return int(m.id)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # 2) Recent history (last 50)
+        try:
+            async for m in ch.history(limit=50):
+                if not m.embeds:
+                    continue
+                if m.embeds[0].title == title and (m.author.id == getattr(bot.user, "id", m.author.id) or m.author.bot):
+                    try:
+                        await m.edit(embed=embed, view=view)
+                        return int(m.id)
+                    except Exception:
+                        continue
         except Exception:
             pass
 
@@ -1739,6 +1792,7 @@ async def ensure_starter_panel(guild: discord.Guild) -> None:
         embed=_build_starter_panel_embed(),
         view=StarterKitPanelView(),
         pin=STARTER_PANEL_PIN,
+        expected_embed_title="🎁 Democracy Bot — Starter Kit Module",
     )
     if msg_id and msg_id != _STARTER_PANEL_MESSAGE_ID_RUNTIME:
         _STARTER_PANEL_MESSAGE_ID_RUNTIME = msg_id
@@ -1769,7 +1823,7 @@ def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Emb
         counts = _poll_counts(active)
         total = sum(counts)
         lines = [
-            "📊 Create and manage polls from this panel.",
+            "📊 Poll controls",
             "",
             "Active poll : YES",
             f"Question    : {active.question[:80]}",
@@ -1779,12 +1833,12 @@ def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Emb
         ]
     else:
         lines = [
-            "📊 Create and manage polls from this panel.",
+            "📊 Poll controls",
             "",
             "Active poll : NO",
             "",
-            "Admins: Press **Create Poll** to start a poll.",
-            "Players: vote on the poll message that appears below.",
+            "Admins: press **Create Poll** to post a new poll in the vote channel.",
+            "Players vote in the vote channel when a poll is posted.",
         ]
 
     e = discord.Embed(
@@ -1792,7 +1846,6 @@ def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Emb
         description=_module_box("POLL MODULE", lines),
         color=0x3498DB,
     )
-    e.set_footer(text="This is the no-command way to run polls in #vote.")
     e.timestamp = datetime.utcnow()
     return e
 
@@ -1901,7 +1954,7 @@ class PersistentPollPanelView(discord.ui.View):
         poll = POLL_BY_CHANNEL.get(channel_id)
         if not poll:
             try:
-                await interaction.response.send_message("ℹ️ No poll found in #vote.", ephemeral=True)
+                await interaction.response.send_message("ℹ️ No active poll found.", ephemeral=True)
             except Exception:
                 pass
             return
@@ -1967,7 +2020,7 @@ async def ensure_poll_panel(guild: discord.Guild) -> None:
     if not _is_digit_id(ch_id):
         return
 
-    active = POLL_BY_CHANNEL.get(int(_poll_vote_channel_id()))
+    active = POLL_BY_CHANNEL.get(int(_poll_vote_channel_id())) if _is_digit_id(_poll_vote_channel_id()) else None
     msg_id = await _ensure_panel_message(
         guild=guild,
         channel_id_str=ch_id,
@@ -1975,6 +2028,7 @@ async def ensure_poll_panel(guild: discord.Guild) -> None:
         embed=_build_poll_panel_embed(active if active and not active.ended else None),
         view=PersistentPollPanelView(),
         pin=POLL_PANEL_PIN,
+        expected_embed_title="📊 Democracy Bot — Poll Module",
     )
     if msg_id and msg_id != _POLL_PANEL_MESSAGE_ID_RUNTIME:
         _POLL_PANEL_MESSAGE_ID_RUNTIME = msg_id
