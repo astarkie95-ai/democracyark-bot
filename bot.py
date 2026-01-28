@@ -75,6 +75,10 @@ SERVER_STATUS_CHANNEL_ID = os.getenv("SERVER_STATUS_CHANNEL_ID", "14659020953278
 SERVER_STATUS_MESSAGE_ID = os.getenv("SERVER_STATUS_MESSAGE_ID", "").strip()     # message id to keep editing (optional)
 SERVER_ANNOUNCE_CHANNEL_ID = os.getenv("SERVER_ANNOUNCE_CHANNEL_ID", "").strip() # (legacy) alerts channel id (optional)
 SERVER_ALERTS_CHANNEL_ID = os.getenv("SERVER_ALERTS_CHANNEL_ID", "1465903053461786698").strip()# dedicated alerts channel id (optional)
+# ✅ NEW: Persistent server control panel (admin-only channel)
+SERVER_CONTROL_CHANNEL_ID = os.getenv("SERVER_CONTROL_CHANNEL_ID", "").strip()   # channel id for 24/7 panel (e.g. #restart-server)
+SERVER_CONTROL_MESSAGE_ID = os.getenv("SERVER_CONTROL_MESSAGE_ID", "").strip()   # message id to keep editing (optional)
+SERVER_CONTROL_PIN = os.getenv("SERVER_CONTROL_PIN", "0").strip().lower() in ("1","true","yes","on")
 
 # ✅ NEW: ping roles (use IDs, not names)
 # Default pings: Owner/Admin/Moderator/Members (you can override in Railway)
@@ -158,6 +162,8 @@ class DemocracyBot(commands.Bot):
         try:
             self.add_view(TicketPanelView())
             self.add_view(TicketControlsView())
+            # ✅ Server control panel: register persistent view for 24/7 buttons
+            self.add_view(PersistentServerControlView())
             print("TICKETS: persistent views registered", flush=True)
         except Exception:
             print("TICKETS: failed to register views:", traceback.format_exc(), flush=True)
@@ -699,13 +705,22 @@ class RestartMessageModal(discord.ui.Modal, title="Restart Democracy Ark"):
 
 class RestartConfirmView(discord.ui.View):
     def __init__(self, requester_id: int, announcement: str):
-        super().__init__(timeout=30)
+        super().__init__(timeout=300)
         self.requester_id = requester_id
         self.announcement = (announcement or "").strip()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only the person who ran the command can confirm/cancel
-        return bool(interaction.user and interaction.user.id == self.requester_id)
+        if interaction.user and interaction.user.id == self.requester_id:
+            return True
+        try:
+            msg = "❌ Only the person who ran the command can use these buttons."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+        return False
 
     @discord.ui.button(label="Confirm restart", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -1109,13 +1124,23 @@ class ServerActionModal(discord.ui.Modal):
 
 class ServerActionConfirmView(discord.ui.View):
     def __init__(self, requester_id: int, action: str, announcement: str):
-        super().__init__(timeout=30)
+        super().__init__(timeout=300)
         self.requester_id = requester_id
         self.action = action
         self.announcement = (announcement or "").strip()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return bool(interaction.user and interaction.user.id == self.requester_id)
+        if interaction.user and interaction.user.id == self.requester_id:
+            return True
+        try:
+            msg = "❌ Only the person who opened this panel can use these buttons. Run the command yourself."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+        return False
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -1194,13 +1219,146 @@ class ServerActionConfirmView(discord.ui.View):
         except Exception:
             pass
 
+# =====================================================================
+# ✅ NEW: Persistent 24/7 Server Control Panel message (no command needed)
+# =====================================================================
+
+def _build_control_panel_embed() -> discord.Embed:
+    box = (
+        "```ansi\n"
+        "⟦ DEMOCRACY ARK : SERVER CONTROL PANEL ⟧\n"
+        "Use the buttons below to Start / Stop / Restart.\n"
+        "You will be prompted for an announcement message.\n"
+        "A confirmation step prevents misclicks.\n"
+        "```"
+    )
+    e = discord.Embed(
+        title="🛠 Democracy Bot — Server Control Panel",
+        description=box,
+    )
+    e.timestamp = datetime.utcnow()
+    return e
+
+class PersistentServerControlView(discord.ui.View):
+    """Persistent buttons so the panel works after bot restarts."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ Server context required.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+
+        if not is_staff_member(interaction.user):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ Staff only.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+
+        return True
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, custom_id="serverctl_start")
+    async def start_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(ServerActionModal(requester_id=interaction.user.id, action="start"))
+        except Exception as e:
+            try:
+                msg = f"❌ Could not open form: {repr(e)}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.secondary, custom_id="serverctl_stop")
+    async def stop_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(ServerActionModal(requester_id=interaction.user.id, action="stop"))
+        except Exception as e:
+            try:
+                msg = f"❌ Could not open form: {repr(e)}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Restart", style=discord.ButtonStyle.danger, custom_id="serverctl_restart")
+    async def restart_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(ServerActionModal(requester_id=interaction.user.id, action="restart"))
+        except Exception as e:
+            try:
+                msg = f"❌ Could not open form: {repr(e)}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+async def ensure_server_control_panel(guild: discord.Guild) -> None:
+    """Ensure the 24/7 control panel message exists and has buttons attached."""
+    if not _is_digit_id(SERVER_CONTROL_CHANNEL_ID):
+        return
+
+    ch = await _get_text_channel(guild, SERVER_CONTROL_CHANNEL_ID)
+    if not ch:
+        return
+
+    view = PersistentServerControlView()
+    embed = _build_control_panel_embed()
+
+    # If message ID is known, edit it in place; otherwise create a new one.
+    if _is_digit_id(SERVER_CONTROL_MESSAGE_ID):
+        try:
+            msg = await ch.fetch_message(int(SERVER_CONTROL_MESSAGE_ID))
+            await msg.edit(embed=embed, view=view)
+            return
+        except Exception:
+            pass
+
+    try:
+        msg = await ch.send(embed=embed, view=view)
+        print(f"[SERVERCTL] New SERVER_CONTROL_MESSAGE_ID = {msg.id} (save this in Railway Variables)", flush=True)
+        # Optional pin
+        if SERVER_CONTROL_PIN:
+            try:
+                await msg.pin(reason="Democracy Bot: server control panel")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 class ServerControlView(discord.ui.View):
     def __init__(self, requester_id: int):
-        super().__init__(timeout=60)
+        super().__init__(timeout=600)
         self.requester_id = requester_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return bool(interaction.user and interaction.user.id == self.requester_id)
+        if interaction.user and interaction.user.id == self.requester_id:
+            return True
+        try:
+            msg = "❌ Only the person who opened this panel can use these buttons. Run the command yourself."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+        return False
 
     @discord.ui.button(label="Start", style=discord.ButtonStyle.success)
     async def start_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -1208,7 +1366,11 @@ class ServerControlView(discord.ui.View):
             await interaction.response.send_modal(ServerActionModal(requester_id=self.requester_id, action="start"))
         except Exception as e:
             try:
-                await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+                msg = f"❌ Could not open form: {repr(e)}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
                 pass
 
@@ -1218,7 +1380,11 @@ class ServerControlView(discord.ui.View):
             await interaction.response.send_modal(ServerActionModal(requester_id=self.requester_id, action="stop"))
         except Exception as e:
             try:
-                await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+                msg = f"❌ Could not open form: {repr(e)}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
                 pass
 
@@ -1228,7 +1394,11 @@ class ServerControlView(discord.ui.View):
             await interaction.response.send_modal(ServerActionModal(requester_id=self.requester_id, action="restart"))
         except Exception as e:
             try:
-                await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+                msg = f"❌ Could not open form: {repr(e)}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
                 pass
 
@@ -1455,6 +1625,13 @@ async def on_ready():
         start_nitrado_status_tasks()
     except Exception:
         print("NITRADO: start tasks failed:", traceback.format_exc(), flush=True)
+
+    # ✅ NEW: ensure the 24/7 server control panel message exists
+    try:
+        for g in bot.guilds:
+            await ensure_server_control_panel(g)
+    except Exception:
+        print("SERVERCTL: ensure panel failed:", traceback.format_exc(), flush=True)
 
 def _render_welcome_message(mention: str) -> str:
     template = (WELCOME_MESSAGE or DEFAULT_WELCOME_MESSAGE).strip()
