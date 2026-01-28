@@ -576,90 +576,63 @@ async def _restart_log(guild: discord.Guild, text: str) -> None:
         except Exception:
             pass
 
-async def nitrado_restart_call() -> Tuple[bool, str]:
+async def _nitrado_post_action(action_label: str, endpoint_suffixes: List[str]) -> Tuple[bool, str]:
     """
-    Calls Nitrado API to restart the gameserver.
-    Requires:
-      - NITRADO_TOKEN
-      - NITRADO_SERVICE_ID (numeric)
+    Try multiple possible Nitrado endpoints for an action. Some products expose slightly different paths.
+    We treat 404 as "try next", but any other non-2xx is returned immediately so you can see the real error.
     """
     if not NITRADO_TOKEN:
         return False, "NITRADO_TOKEN missing in Railway Variables."
     if not _is_digit_id(NITRADO_SERVICE_ID):
         return False, "NITRADO_SERVICE_ID missing/invalid in Railway Variables."
 
-    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers/restart"
     headers = {
         "Authorization": f"Bearer {NITRADO_TOKEN}",
         "Accept": "application/json",
     }
 
+    last_404 = None
     try:
-        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.post(url) as resp:
-                body = await resp.text()
-                if 200 <= resp.status < 300:
-                    return True, "Restart request sent to Nitrado."
-                return False, f"Nitrado API error {resp.status}: {body[:300]}"
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as session:
+            for suffix in endpoint_suffixes:
+                url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/{suffix.lstrip('/')}"
+                async with session.post(url) as resp:
+                    body = await resp.text()
+                    if 200 <= resp.status < 300:
+                        return True, f"{action_label} triggered via `{suffix}`."
+                    if resp.status == 404:
+                        last_404 = f"{resp.status}: {body}"
+                        continue
+                    return False, f"{action_label} failed ({resp.status}): {body}"
     except Exception as e:
-        return False, f"Request failed: {repr(e)}"
+        return False, f"{action_label} failed: {type(e).__name__}: {e}"
+
+    return False, f"{action_label} failed. Endpoints not found (last 404: {last_404})."
+
+async def nitrado_restart_call() -> Tuple[bool, str]:
+    """Restart the gameserver."""
+    return await _nitrado_post_action("RESTART", [
+        "gameservers/restart",
+        "gameserver/restart",
+    ])
 
 async def nitrado_start_call() -> Tuple[bool, str]:
-    """
-    Calls Nitrado API to start the gameserver.
-    Requires:
-      - NITRADO_TOKEN
-      - NITRADO_SERVICE_ID (numeric)
-    """
-    if not NITRADO_TOKEN:
-        return False, "NITRADO_TOKEN missing in Railway Variables."
-    if not _is_digit_id(NITRADO_SERVICE_ID):
-        return False, "NITRADO_SERVICE_ID missing/invalid in Railway Variables."
-
-    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers/start"
-    headers = {
-        "Authorization": f"Bearer {NITRADO_TOKEN}",
-        "Accept": "application/json",
-    }
-
-    try:
-        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.post(url) as resp:
-                body = await resp.text()
-                if 200 <= resp.status < 300:
-                    return True, "Start request sent to Nitrado."
-                return False, f"Nitrado API error {resp.status}: {body[:300]}"
-    except Exception as e:
-        return False, f"Request failed: {repr(e)}"
-
+    """Start the gameserver (with a safe fallback)."""
+    # Some Nitrado products do not expose a dedicated /start action.
+    # If so, /restart often starts a stopped server.
+    return await _nitrado_post_action("START", [
+        "gameservers/start",
+        "gameserver/start",
+        "gameservers/restart",  # fallback
+        "gameserver/restart",
+    ])
 
 async def nitrado_stop_call() -> Tuple[bool, str]:
-    """
-    Calls Nitrado API to stop the gameserver.
-    Requires:
-      - NITRADO_TOKEN
-      - NITRADO_SERVICE_ID (numeric)
-    """
-    if not NITRADO_TOKEN:
-        return False, "NITRADO_TOKEN missing in Railway Variables."
-    if not _is_digit_id(NITRADO_SERVICE_ID):
-        return False, "NITRADO_SERVICE_ID missing/invalid in Railway Variables."
-
-    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers/stop"
-    headers = {
-        "Authorization": f"Bearer {NITRADO_TOKEN}",
-        "Accept": "application/json",
-    }
-
-    try:
-        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.post(url) as resp:
-                body = await resp.text()
-                if 200 <= resp.status < 300:
-                    return True, "Stop request sent to Nitrado."
-                return False, f"Nitrado API error {resp.status}: {body[:300]}"
-    except Exception as e:
-        return False, f"Request failed: {repr(e)}"
+    """Stop the gameserver."""
+    return await _nitrado_post_action("STOP", [
+        "gameservers/stop",
+        "gameserver/stop",
+    ])
 
 class RestartMessageModal(discord.ui.Modal, title="Restart Democracy Ark"):
     restart_message = discord.ui.TextInput(
