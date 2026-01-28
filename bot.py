@@ -92,12 +92,6 @@ POLL_PANEL_CHANNEL_ID = os.getenv("POLL_PANEL_CHANNEL_ID", "").strip()
 POLL_PANEL_MESSAGE_ID = os.getenv("POLL_PANEL_MESSAGE_ID", "").strip()
 POLL_PANEL_PIN = os.getenv("POLL_PANEL_PIN", "1").strip().lower() in ("1","true","yes","on")
 
-
-# ✅ NEW: Poll module channels split (optional)
-# - POLL_CREATE_CHANNEL_ID: where the Poll PANEL lives (private staff channel, e.g. #create-poll)
-# - POLL_VOTE_CHANNEL_ID  : where polls are posted for players to vote (public, e.g. #vote)
-POLL_CREATE_CHANNEL_ID = os.getenv("POLL_CREATE_CHANNEL_ID", "").strip()
-POLL_VOTE_CHANNEL_ID = os.getenv("POLL_VOTE_CHANNEL_ID", "").strip()
 # ✅ NEW: ping roles (use IDs, not names)
 # Default pings: Owner/Admin/Moderator/Members (you can override in Railway)
 SERVER_PING_ROLE_IDS = os.getenv(
@@ -124,6 +118,17 @@ NITRADO_STATUS_POLL_SECONDS = os.getenv("NITRADO_STATUS_POLL_SECONDS", "60").str
 # You can override this in Railway by setting OWNERS_ROLE_ID, otherwise it uses your saved ID.
 OWNERS_ROLE_ID_ENV = os.getenv("OWNERS_ROLE_ID", "").strip()
 OWNERS_ROLE_ID = int(OWNERS_ROLE_ID_ENV) if OWNERS_ROLE_ID_ENV.isdigit() else 1461514415559147725
+
+# Admin/Moderator roles (used for visibility/permissions in module panels)
+ADMIN_ROLE_ID_ENV = os.getenv("ADMIN_ROLE_ID", "").strip()
+ADMIN_ROLE_ID = int(ADMIN_ROLE_ID_ENV) if ADMIN_ROLE_ID_ENV.isdigit() else 1461514871396106404
+MODERATOR_ROLE_ID_ENV = os.getenv("MODERATOR_ROLE_ID", "").strip()
+MODERATOR_ROLE_ID = int(MODERATOR_ROLE_ID_ENV) if MODERATOR_ROLE_ID_ENV.isdigit() else 1461515030800629915
+
+# ✅ NEW: Starter Kit Admin module panel (keep admin-only tools out of public channels)
+STARTER_ADMIN_CHANNEL_ID = os.getenv("STARTER_ADMIN_CHANNEL_ID", "").strip()  # optional; defaults to SERVER_CONTROL_CHANNEL_ID if set
+STARTER_ADMIN_MESSAGE_ID = os.getenv("STARTER_ADMIN_MESSAGE_ID", "").strip()  # optional (panel message id to edit)
+STARTER_ADMIN_PIN = (os.getenv("STARTER_ADMIN_PIN", "1").strip().lower() in ("1", "true", "yes", "on"))
 
 DEFAULT_WELCOME_MESSAGE = (
     "Welcome to Democracy Ark, {mention}! Please read the rules and treat others with respect."
@@ -195,6 +200,7 @@ class DemocracyBot(commands.Bot):
             # ✅ Server control panel: register persistent view for 24/7 buttons
             self.add_view(PersistentServerControlView())
             self.add_view(StarterKitPanelView())
+            self.add_view(StarterKitAdminPanelView())
             self.add_view(PersistentPollPanelView())
             print("TICKETS: persistent views registered", flush=True)
         except Exception:
@@ -588,6 +594,32 @@ def is_admin(interaction: discord.Interaction) -> bool:
         p = interaction.user.guild_permissions
         return p.administrator or p.manage_guild or p.manage_channels
     return False
+
+def is_owner_or_admin(interaction: discord.Interaction) -> bool:
+    """Owners/Admins only (role-based). Falls back to guild admin perms."""
+    if not interaction.guild or not interaction.user:
+        return False
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    member: discord.Member = interaction.user
+    role_ids = {r.id for r in getattr(member, "roles", [])}
+    if OWNERS_ROLE_ID in role_ids or ADMIN_ROLE_ID in role_ids:
+        return True
+    # fallback: true server admins still count
+    p = member.guild_permissions
+    return bool(p.administrator)
+
+def _find_text_channel_id_by_name(guild: discord.Guild, name: str) -> int:
+    name = (name or "").strip().lower().lstrip("#")
+    if not name:
+        return 0
+    for ch in getattr(guild, "text_channels", []):
+        try:
+            if ch and ch.name.lower() == name:
+                return int(ch.id)
+        except Exception:
+            continue
+    return 0
 
 def _parse_id_set(csv_ids: str) -> Set[int]:
     out: Set[int] = set()
@@ -1544,6 +1576,7 @@ async def _announce_server_action(guild: discord.Guild, action: str, message: st
 # =====================================================================
 
 _STARTER_PANEL_MESSAGE_ID_RUNTIME: int = int(STARTER_PANEL_MESSAGE_ID) if _is_digit_id(STARTER_PANEL_MESSAGE_ID) else 0
+_STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME: int = int(STARTER_ADMIN_MESSAGE_ID) if _is_digit_id(STARTER_ADMIN_MESSAGE_ID) else 0
 _POLL_PANEL_MESSAGE_ID_RUNTIME: int = int(POLL_PANEL_MESSAGE_ID) if _is_digit_id(POLL_PANEL_MESSAGE_ID) else 0
 
 def _module_box(header: str, lines: List[str]) -> str:
@@ -1561,29 +1594,21 @@ def _starter_panel_channel_id() -> str:
     return STARTER_PANEL_CHANNEL_ID if _is_digit_id(STARTER_PANEL_CHANNEL_ID) else CLAIM_CHANNEL_ID
 
 def _poll_panel_channel_id() -> str:
-    """Where the Poll MODULE PANEL message lives (staff/private by default)."""
-    # Prefer explicit create channel, then POLL_PANEL_CHANNEL_ID, then fall back to VOTE_CHANNEL_ID (last resort).
-    if _is_digit_id(POLL_CREATE_CHANNEL_ID):
-        return POLL_CREATE_CHANNEL_ID
-    if _is_digit_id(POLL_PANEL_CHANNEL_ID):
-        return POLL_PANEL_CHANNEL_ID
-    return VOTE_CHANNEL_ID
+    """Where the Poll MODULE PANEL message lives."""
+    return POLL_PANEL_CHANNEL_ID if _is_digit_id(POLL_PANEL_CHANNEL_ID) else VOTE_CHANNEL_ID
 
 def _poll_vote_channel_id() -> str:
-    """Where polls are posted and voted on (public by default)."""
-    # Prefer explicit vote channel, then VOTE_CHANNEL_ID.
-    if _is_digit_id(POLL_VOTE_CHANNEL_ID):
-        return POLL_VOTE_CHANNEL_ID
-    return VOTE_CHANNEL_ID
+    """Where polls are actually posted and voted on (defaults to VOTE_CHANNEL_ID)."""
+    return VOTE_CHANNEL_ID if _is_digit_id(VOTE_CHANNEL_ID) else _poll_panel_channel_id()
 
 def _build_starter_panel_embed() -> discord.Embed:
     lines = [
-        "🎁 Starter kits are available here.",
+        "🎁 Claim your starter kit without commands.",
         "",
-        f"Available kits : {len(PINS_POOL)}",
+        f"Available vaults : {len(PINS_POOL)}",
         "One per person : enabled",
         "",
-        "Press **Claim Starter Kit** to receive your box + PIN privately.",
+        "Press **Claim Starter Kit** to receive your vault PIN privately.",
     ]
     e = discord.Embed(
         title="🎁 Democracy Bot — Starter Kit Module",
@@ -1595,7 +1620,7 @@ def _build_starter_panel_embed() -> discord.Embed:
     return e
 
 class StarterKitPanelView(discord.ui.View):
-    """Persistent view for the Starter Kit module panel."""
+    """Persistent view for the public Starter Kit module panel."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1604,9 +1629,9 @@ class StarterKitPanelView(discord.ui.View):
         if not interaction.user:
             return
 
-        # Enforce claim channel if configured
+        # Enforce claim channel if configured; if not configured, panel itself controls where it's posted.
         allowed_ch = _starter_panel_channel_id()
-        if not _only_in_channel(interaction, allowed_ch):
+        if _is_digit_id(allowed_ch) and (not _only_in_channel(interaction, allowed_ch)):
             await _wrong_channel(interaction, "#claim-starter-kit")
             return
 
@@ -1617,7 +1642,7 @@ class StarterKitPanelView(discord.ui.View):
             box, pin = CLAIMS[uid]
             try:
                 await interaction.response.send_message(
-                    f"✅ You already claimed a kit.\n**Your box:** #{box}\n**Your PIN:** `{pin}`",
+                    f"✅ You already claimed a starter vault.\n**Your vault:** #{box}\n**Your PIN:** `{pin}`",
                     ephemeral=True,
                 )
             except Exception:
@@ -1627,14 +1652,14 @@ class StarterKitPanelView(discord.ui.View):
         if not PINS_POOL:
             try:
                 await interaction.response.send_message(
-                    "❌ No starter kits available right now.\nAsk an admin to restock.",
+                    "❌ No starter vaults available right now.\nAsk an admin to restock.",
                     ephemeral=True,
                 )
             except Exception:
                 pass
             return
 
-        # Pick lowest box number available
+        # Pick lowest vault number available
         box = sorted(PINS_POOL.keys())[0]
         bp = PINS_POOL.pop(box)
 
@@ -1643,10 +1668,10 @@ class StarterKitPanelView(discord.ui.View):
         await save_claims_only()
 
         msg = (
-            f"🎁 Starter kit claimed!\n"
-            f"**Your box:** #{bp.box}\n"
+            f"🎁 Starter vault claimed!\n"
+            f"**Your vault:** #{bp.box}\n"
             f"**Your PIN:** `{bp.pin}`\n\n"
-            f"Go to the Community Hub and unlock **Box #{bp.box}** with that PIN."
+            f"Go to the Community Hub and unlock **Vault #{bp.box}** with that PIN."
         )
 
         # Ephemeral + DM fallback
@@ -1663,6 +1688,7 @@ class StarterKitPanelView(discord.ui.View):
         try:
             if interaction.guild:
                 await refresh_starter_panel(interaction.guild)
+                await refresh_starter_admin_panel(interaction.guild)
         except Exception:
             pass
 
@@ -1670,8 +1696,8 @@ class StarterKitPanelView(discord.ui.View):
     async def claim_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         await self._claim(interaction)
 
-    @discord.ui.button(label="My Kit", style=discord.ButtonStyle.secondary, custom_id="starterpanel_mykit")
-    async def mykit_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+    @discord.ui.button(label="My Vault", style=discord.ButtonStyle.secondary, custom_id="starterpanel_myvault")
+    async def myvault_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user:
             return
         uid = interaction.user.id
@@ -1679,7 +1705,7 @@ class StarterKitPanelView(discord.ui.View):
             box, pin = CLAIMS[uid]
             try:
                 await interaction.response.send_message(
-                    f"✅ Your kit:\n**Box:** #{box}\n**PIN:** `{pin}`",
+                    f"✅ Your starter vault:\n**Vault:** #{box}\n**PIN:** `{pin}`",
                     ephemeral=True,
                 )
             except Exception:
@@ -1687,24 +1713,140 @@ class StarterKitPanelView(discord.ui.View):
         else:
             try:
                 await interaction.response.send_message(
-                    "ℹ️ You haven't claimed a starter kit yet.\nPress **Claim Starter Kit**.",
+                    "ℹ️ You haven't claimed a starter vault yet.\nPress **Claim Starter Kit**.",
                     ephemeral=True,
                 )
             except Exception:
                 pass
 
-    @discord.ui.button(label="Pool Count (Admin)", style=discord.ButtonStyle.success, custom_id="starterpanel_poolcount")
-    async def poolcount_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not is_admin(interaction):
-            try:
-                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-            except Exception:
-                pass
+
+def _starter_admin_channel_id() -> str:
+    # Prefer explicit admin channel, otherwise reuse server-control-panel channel if configured.
+    if _is_digit_id(STARTER_ADMIN_CHANNEL_ID):
+        return STARTER_ADMIN_CHANNEL_ID
+    if _is_digit_id(SERVER_CONTROL_CHANNEL_ID):
+        return SERVER_CONTROL_CHANNEL_ID
+    return ""
+
+
+def _build_starter_admin_panel_embed() -> discord.Embed:
+    lines = [
+        "Admin tools for managing the starter vault pool.",
+        "",
+        f"Available vaults : {len(PINS_POOL)}",
+        f"Claimed vaults   : {len(CLAIMS)}",
+        f"Storage          : {'Database' if DB_POOL else 'CSV files'}",
+        "",
+        "Use the buttons below to add or delete vaults from the pool.",
+    ]
+    e = discord.Embed(
+        title="🗄️ Democracy Bot — Starter Vault Admin",
+        description=_module_box("STARTER VAULT ADMIN", lines),
+        color=0xE67E22,
+    )
+    e.set_footer(text="Tip: Keep this panel in an Owners/Admin-only channel.")
+    e.timestamp = datetime.utcnow()
+    return e
+
+
+async def starter_add_vault(vault_number: int, pin: str):
+    try:
+        vault = int(vault_number)
+    except Exception:
+        return False, "Vault number must be a number."
+    pin = (pin or "").strip()
+    if vault <= 0:
+        return False, "Vault number must be 1 or higher."
+    if not pin:
+        return False, "PIN cannot be empty."
+
+    if vault in PINS_POOL:
+        return False, f"Vault #{vault} is already in the pool."
+    for _, (b, _) in CLAIMS.items():
+        if int(b) == vault:
+            return False, f"Vault #{vault} is already claimed."
+
+    PINS_POOL[vault] = BoxPin(box=vault, pin=pin)
+    await save_pool_state()
+    return True, f"✅ Added Vault #{vault} to the pool."
+
+
+async def starter_delete_vault(vault_number: int):
+    try:
+        vault = int(vault_number)
+    except Exception:
+        return False, "Vault number must be a number."
+    if vault <= 0:
+        return False, "Vault number must be 1 or higher."
+
+    if vault not in PINS_POOL:
+        return False, f"Vault #{vault} is not currently in the pool (it may be claimed or not exist)."
+
+    PINS_POOL.pop(vault, None)
+    await save_pool_state()
+    return True, f"✅ Deleted Vault #{vault} from the pool."
+
+
+class StarterAddVaultModal(discord.ui.Modal, title="Add Starter Vault"):
+    vault_number = discord.ui.TextInput(label="Vault number", placeholder="e.g. 12", required=True, max_length=10)
+    vault_pin = discord.ui.TextInput(label="Vault PIN", placeholder="e.g. 7391", required=True, max_length=32)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_owner_or_admin(interaction):
+            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
             return
+        ok, msg = await starter_add_vault(str(self.vault_number.value).strip(), str(self.vault_pin.value).strip())
+        await interaction.response.send_message(msg, ephemeral=True)
         try:
-            await interaction.response.send_message(pool_counts(), ephemeral=True)
+            if interaction.guild:
+                await refresh_starter_panel(interaction.guild)
+                await refresh_starter_admin_panel(interaction.guild)
         except Exception:
             pass
+
+
+class StarterDeleteVaultModal(discord.ui.Modal, title="Delete Starter Vault"):
+    vault_number = discord.ui.TextInput(label="Vault number", placeholder="e.g. 12", required=True, max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_owner_or_admin(interaction):
+            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
+            return
+        ok, msg = await starter_delete_vault(str(self.vault_number.value).strip())
+        await interaction.response.send_message(msg, ephemeral=True)
+        try:
+            if interaction.guild:
+                await refresh_starter_panel(interaction.guild)
+                await refresh_starter_admin_panel(interaction.guild)
+        except Exception:
+            pass
+
+
+class StarterKitAdminPanelView(discord.ui.View):
+    """Persistent view for the Starter Vault Admin panel (keep in admin-only channel)."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Add Vault", style=discord.ButtonStyle.success, custom_id="starteradmin_addvault")
+    async def addvault_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not is_owner_or_admin(interaction):
+            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
+            return
+        await interaction.response.send_modal(StarterAddVaultModal())
+
+    @discord.ui.button(label="Delete Vault", style=discord.ButtonStyle.danger, custom_id="starteradmin_deletevault")
+    async def deletevault_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not is_owner_or_admin(interaction):
+            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
+            return
+        await interaction.response.send_modal(StarterDeleteVaultModal())
+
+    @discord.ui.button(label="Pool Count", style=discord.ButtonStyle.secondary, custom_id="starteradmin_poolcount")
+    async def poolcount_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not is_owner_or_admin(interaction):
+            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
+            return
+        await interaction.response.send_message(pool_counts(), ephemeral=True)
 
 async def _ensure_panel_message(
     guild: discord.Guild,
@@ -1713,15 +1855,8 @@ async def _ensure_panel_message(
     embed: discord.Embed,
     view: discord.ui.View,
     pin: bool = False,
-    expected_embed_title: Optional[str] = None,
 ) -> Optional[int]:
-    """Generic helper used by module panels.
-
-    Strategy:
-    1) If message id is known (Railway var / runtime), edit it.
-    2) Else try to locate an existing pinned/recent panel by embed title (avoids duplicates on restart).
-    3) Else send a new one (and optionally pin it).
-    """
+    """Generic helper used by module panels."""
     ch = await _get_text_channel(guild, channel_id_str)
     if not ch:
         return None
@@ -1732,38 +1867,6 @@ async def _ensure_panel_message(
             msg = await ch.fetch_message(int(current_id))
             await msg.edit(embed=embed, view=view)
             return int(msg.id)
-        except Exception:
-            pass
-
-    # Try to reuse an existing pinned/recent panel to avoid duplicates (even if Railway message id isn't set)
-    title = expected_embed_title or (embed.title or "")
-    if title:
-        # 1) Pinned messages
-        try:
-            pins = await ch.pins()
-            for m in pins:
-                if not m.embeds:
-                    continue
-                if m.embeds[0].title == title and (m.author.id == getattr(bot.user, "id", m.author.id) or m.author.bot):
-                    try:
-                        await m.edit(embed=embed, view=view)
-                        return int(m.id)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-        # 2) Recent history (last 50)
-        try:
-            async for m in ch.history(limit=50):
-                if not m.embeds:
-                    continue
-                if m.embeds[0].title == title and (m.author.id == getattr(bot.user, "id", m.author.id) or m.author.bot):
-                    try:
-                        await m.edit(embed=embed, view=view)
-                        return int(m.id)
-                    except Exception:
-                        continue
         except Exception:
             pass
 
@@ -1783,7 +1886,12 @@ async def ensure_starter_panel(guild: discord.Guild) -> None:
 
     ch_id = _starter_panel_channel_id()
     if not _is_digit_id(ch_id):
-        return
+        # Try by name in case you didn't set IDs
+        found = _find_text_channel_id_by_name(guild, "claim-starter-kit")
+        if found:
+            ch_id = str(found)
+        else:
+            return
 
     msg_id = await _ensure_panel_message(
         guild=guild,
@@ -1792,7 +1900,6 @@ async def ensure_starter_panel(guild: discord.Guild) -> None:
         embed=_build_starter_panel_embed(),
         view=StarterKitPanelView(),
         pin=STARTER_PANEL_PIN,
-        expected_embed_title="🎁 Democracy Bot — Starter Kit Module",
     )
     if msg_id and msg_id != _STARTER_PANEL_MESSAGE_ID_RUNTIME:
         _STARTER_PANEL_MESSAGE_ID_RUNTIME = msg_id
@@ -1823,7 +1930,7 @@ def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Emb
         counts = _poll_counts(active)
         total = sum(counts)
         lines = [
-            "📊 Poll controls",
+            "📊 Create and manage polls from this panel.",
             "",
             "Active poll : YES",
             f"Question    : {active.question[:80]}",
@@ -1833,12 +1940,12 @@ def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Emb
         ]
     else:
         lines = [
-            "📊 Poll controls",
+            "📊 Create and manage polls from this panel.",
             "",
             "Active poll : NO",
             "",
-            "Admins: press **Create Poll** to post a new poll in the vote channel.",
-            "Players vote in the vote channel when a poll is posted.",
+            "Admins: Press **Create Poll** to start a poll.",
+            "Players: vote on the poll message that appears below.",
         ]
 
     e = discord.Embed(
@@ -1846,6 +1953,7 @@ def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Emb
         description=_module_box("POLL MODULE", lines),
         color=0x3498DB,
     )
+    e.set_footer(text="This is the no-command way to run polls in #vote.")
     e.timestamp = datetime.utcnow()
     return e
 
@@ -1954,7 +2062,7 @@ class PersistentPollPanelView(discord.ui.View):
         poll = POLL_BY_CHANNEL.get(channel_id)
         if not poll:
             try:
-                await interaction.response.send_message("ℹ️ No active poll found.", ephemeral=True)
+                await interaction.response.send_message("ℹ️ No poll found in #vote.", ephemeral=True)
             except Exception:
                 pass
             return
@@ -2020,7 +2128,7 @@ async def ensure_poll_panel(guild: discord.Guild) -> None:
     if not _is_digit_id(ch_id):
         return
 
-    active = POLL_BY_CHANNEL.get(int(_poll_vote_channel_id())) if _is_digit_id(_poll_vote_channel_id()) else None
+    active = POLL_BY_CHANNEL.get(int(_poll_vote_channel_id()))
     msg_id = await _ensure_panel_message(
         guild=guild,
         channel_id_str=ch_id,
@@ -2028,12 +2136,53 @@ async def ensure_poll_panel(guild: discord.Guild) -> None:
         embed=_build_poll_panel_embed(active if active and not active.ended else None),
         view=PersistentPollPanelView(),
         pin=POLL_PANEL_PIN,
-        expected_embed_title="📊 Democracy Bot — Poll Module",
     )
     if msg_id and msg_id != _POLL_PANEL_MESSAGE_ID_RUNTIME:
         _POLL_PANEL_MESSAGE_ID_RUNTIME = msg_id
         print(f"[POLL] New POLL_PANEL_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
 
+
+async def refresh_starter_admin_panel(guild: discord.Guild) -> None:
+    """Update the Starter Vault Admin panel embed in-place."""
+    global _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME
+    if not _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME:
+        return
+    ch_id = _starter_admin_channel_id()
+    if not _is_digit_id(ch_id):
+        return
+    ch = await _get_text_channel(guild, ch_id)
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(int(_STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME))
+        await msg.edit(embed=_build_starter_admin_panel_embed(), view=StarterKitAdminPanelView())
+    except Exception:
+        pass
+
+async def ensure_starter_admin_panel(guild: discord.Guild) -> None:
+    """Ensure the Starter Vault Admin panel exists (recommended: keep in Owners/Admin-only channel)."""
+    global _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME
+
+    ch_id = _starter_admin_channel_id()
+    if not _is_digit_id(ch_id):
+        found = _find_text_channel_id_by_name(guild, "server-control-panel")
+        if found:
+            ch_id = str(found)
+        else:
+            return
+
+    msg_id = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=ch_id,
+        message_id_runtime_name="_STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME",
+        embed=_build_starter_admin_panel_embed(),
+        view=StarterKitAdminPanelView(),
+        pin=STARTER_ADMIN_PIN,
+        expected_embed_title="🗄️ Democracy Bot — Starter Vault Admin",
+    )
+    if msg_id and msg_id != _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME:
+        _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME = msg_id
+        print(f"[STARTER-ADMIN] New STARTER_ADMIN_MESSAGE_ID = {msg_id} (optional to save in Railway Variables)", flush=True)
 async def refresh_poll_panel(guild: discord.Guild, vote_channel_id: int) -> None:
     global _POLL_PANEL_MESSAGE_ID_RUNTIME
     if not _POLL_PANEL_MESSAGE_ID_RUNTIME:
@@ -2176,7 +2325,7 @@ def append_reset_log(admin_id: int, box: int, user_id: int, pin: str, reason: st
         w.writerow([int(time.time()), admin_id, box, user_id, pin, reason])
 
 def pool_counts() -> str:
-    return f"Available starter kits: **{len(PINS_POOL)}**"
+    return f"Available starter vaults: **{len(PINS_POOL)}**"
 
 # -----------------------
 # ✅ NEW: persistence wrappers (DB preferred, CSV fallback)
@@ -2270,6 +2419,7 @@ async def on_ready():
             await ensure_server_control_panel(g)
             # ✅ NEW: ensure Starter Kit + Poll panels exist (no-command modules)
             await ensure_starter_panel(g)
+            await ensure_starter_admin_panel(g)
             await ensure_poll_panel(g)
     except Exception:
         print("MODULES: ensure panels failed:", traceback.format_exc(), flush=True)
@@ -2476,7 +2626,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
 
     if box in PINS_POOL:
         await interaction.response.send_message(
-            f"❌ Box #{box} is already in the pool.\nPick another box number.",
+            f"❌ Vault #{box} is already in the pool.\nPick another box number.",
             ephemeral=True
         )
         return
@@ -2485,7 +2635,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
     for uid, (claimed_box, _) in CLAIMS.items():
         if claimed_box == box:
             await interaction.response.send_message(
-                f"❌ Box #{box} is currently claimed.\nUse `/resetbox {box}` if you want to put it back.",
+                f"❌ Vault #{box} is currently claimed.\nUse `/resetbox {box}` if you want to put it back.",
                 ephemeral=True
             )
             return
@@ -2501,7 +2651,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
         pass
 
     await interaction.response.send_message(
-        f"✅ Added starter kit to pool.\n**Box:** #{box}\n**PIN:** `{pin}`\n\n{pool_counts()}",
+        f"✅ Added starter kit to pool.\n**Vault:** #{box}\n**PIN:** `{pin}`\n\n{pool_counts()}",
         ephemeral=True
     )
 
@@ -2589,7 +2739,7 @@ async def resetbox(interaction: discord.Interaction, box: int):
     # If already available, nothing to do
     if box in PINS_POOL:
         await interaction.response.send_message(
-            f"ℹ️ Box #{box} is already in the pool.\n{pool_counts()}",
+            f"ℹ️ Vault #{box} is already in the pool.\n{pool_counts()}",
             ephemeral=True
         )
         return
@@ -2606,7 +2756,7 @@ async def resetbox(interaction: discord.Interaction, box: int):
 
     if claimant_uid is None or claimant_pin is None:
         await interaction.response.send_message(
-            f"❌ I can’t find Box #{box} in current claims or pool.\n"
+            f"❌ I can’t find Vault #{box} in current claims or pool.\n"
             f"It may never have been claimed, or your claims file got wiped.",
             ephemeral=True
         )
@@ -2681,7 +2831,7 @@ async def claimstarter(interaction: discord.Interaction):
     if uid in CLAIMS:
         box, pin = CLAIMS[uid]
         await interaction.response.send_message(
-            f"✅ You already claimed a kit.\n**Your box:** #{box}\n**Your PIN:** `{pin}`",
+            f"✅ You already claimed a kit.\n**Your vault:** #{box}\n**Your PIN:** `{pin}`",
             ephemeral=True
         )
         return
@@ -2713,9 +2863,9 @@ async def claimstarter(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"🎁 Starter kit claimed!\n"
-        f"**Your box:** #{bp.box}\n"
+        f"**Your vault:** #{bp.box}\n"
         f"**Your PIN:** `{bp.pin}`\n\n"
-        f"Go to the Community Hub and unlock **Box #{bp.box}** with that PIN.\n\n"
+        f"Go to the Community Hub and unlock **Vault #{bp.box}** with that PIN.\n\n"
         f"{pool_counts()}",
         ephemeral=True
     )
