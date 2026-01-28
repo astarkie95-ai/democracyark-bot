@@ -12,6 +12,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import aiohttp  # ✅ NEW: Nitrado API calls
+
 from flask import Flask
 from threading import Thread
 
@@ -61,6 +63,16 @@ TICKET_NAME_PREFIX = os.getenv("TICKET_NAME_PREFIX", "ticket").strip() or "ticke
 # ✅ NEW: Neon Postgres connection string (set this in Railway Variables)
 # Example: postgresql://user:pass@host/db?sslmode=require
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# ✅ NEW: Nitrado restart (Owners-only)
+NITRADO_TOKEN = os.getenv("NITRADO_TOKEN", "").strip()
+NITRADO_SERVICE_ID = os.getenv("NITRADO_SERVICE_ID", "").strip()  # e.g. 18512293
+RESTART_LOG_CHANNEL_ID = os.getenv("RESTART_LOG_CHANNEL_ID", "").strip()
+
+# Owners role (ONLY this role can use /restartdemocracy)
+# You can override this in Railway by setting OWNERS_ROLE_ID, otherwise it uses your saved ID.
+OWNERS_ROLE_ID_ENV = os.getenv("OWNERS_ROLE_ID", "").strip()
+OWNERS_ROLE_ID = int(OWNERS_ROLE_ID_ENV) if OWNERS_ROLE_ID_ENV.isdigit() else 1461514415559147725
 
 DEFAULT_WELCOME_MESSAGE = (
     "Welcome to Democracy Ark, {mention}! Please read the rules and treat others with respect."
@@ -434,6 +446,118 @@ def is_staff_member(member: discord.Member) -> bool:
             return True
     return False
 
+# =====================================================================
+# ✅ NEW: Nitrado restart system (Owners-only) - /restartdemocracy
+# =====================================================================
+
+_last_restart_at: int = 0
+RESTART_COOLDOWN_SECONDS: int = 5 * 60  # 5 minutes
+
+def _is_digit_id(s: str) -> bool:
+    return bool(s and s.isdigit())
+
+def is_owner_member(member: discord.Member) -> bool:
+    """Owners-only gate for /restartdemocracy."""
+    try:
+        for r in getattr(member, "roles", []):
+            if r and r.id == int(OWNERS_ROLE_ID):
+                return True
+    except Exception:
+        pass
+    return False
+
+async def _restart_log(guild: discord.Guild, text: str) -> None:
+    if not _is_digit_id(RESTART_LOG_CHANNEL_ID):
+        return
+    ch = guild.get_channel(int(RESTART_LOG_CHANNEL_ID))
+    if isinstance(ch, discord.TextChannel):
+        try:
+            await ch.send(text)
+        except Exception:
+            pass
+
+async def nitrado_restart_call() -> Tuple[bool, str]:
+    """
+    Calls Nitrado API to restart the gameserver.
+    Requires:
+      - NITRADO_TOKEN
+      - NITRADO_SERVICE_ID (numeric)
+    """
+    if not NITRADO_TOKEN:
+        return False, "NITRADO_TOKEN missing in Railway Variables."
+    if not _is_digit_id(NITRADO_SERVICE_ID):
+        return False, "NITRADO_SERVICE_ID missing/invalid in Railway Variables."
+
+    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers/restart"
+    headers = {
+        "Authorization": f"Bearer {NITRADO_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.post(url) as resp:
+                body = await resp.text()
+                if 200 <= resp.status < 300:
+                    return True, "Restart request sent to Nitrado."
+                return False, f"Nitrado API error {resp.status}: {body[:300]}"
+    except Exception as e:
+        return False, f"Request failed: {repr(e)}"
+
+class RestartConfirmView(discord.ui.View):
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=30)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Only the person who ran the command can confirm/cancel
+        return bool(interaction.user and interaction.user.id == self.requester_id)
+
+    @discord.ui.button(label="Confirm restart", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
+        global _last_restart_at
+
+        now = int(time.time())
+        if now - _last_restart_at < RESTART_COOLDOWN_SECONDS:
+            wait = RESTART_COOLDOWN_SECONDS - (now - _last_restart_at)
+            try:
+                await interaction.response.edit_message(content=f"⏳ Cooldown active. Try again in {wait}s.", view=None)
+            except Exception:
+                pass
+            return
+
+        # Defer quickly
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        ok, msg = await nitrado_restart_call()
+        if ok:
+            _last_restart_at = now
+            try:
+                await interaction.followup.send("🔄 **Restart requested.** Nitrado will reboot the server shortly.", ephemeral=True)
+            except Exception:
+                pass
+
+            if interaction.guild:
+                await _restart_log(
+                    interaction.guild,
+                    f"🔄 Server restart requested by {interaction.user} (`{interaction.user.id}`).",
+                )
+        else:
+            try:
+                await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        try:
+            await interaction.response.edit_message(content="Cancelled.", view=None)
+        except Exception:
+            pass
+
 # -----------------------
 # ✅ NEW: Helpers — enforce specific channels for commands
 # -----------------------
@@ -652,6 +776,28 @@ async def on_member_join(member: discord.Member):
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong ✅", ephemeral=True)
+
+# -----------------------
+# ✅ Owners-only: restart Nitrado server
+# -----------------------
+@bot.tree.command(name="restartdemocracy", description="Owners only: restart the Nitrado ASA server.")
+async def restartdemocracy(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+        return
+
+    if not is_owner_member(interaction.user):
+        await interaction.response.send_message("❌ Owners only.", ephemeral=True)
+        return
+
+    view = RestartConfirmView(requester_id=interaction.user.id)
+    await interaction.response.send_message(
+        "⚠️ **Restart Democracy Ark now?**\n"
+        "This will reboot the server via Nitrado and kick players.\n\n"
+        "Press **Confirm restart** to proceed.",
+        view=view,
+        ephemeral=True,
+    )
 
 # -----------------------
 # ✅ Admin: test welcome message
@@ -1287,9 +1433,6 @@ TICKET_PRIORITIES = ["low", "normal", "high", "urgent"]
 
 def _now() -> int:
     return int(time.time())
-
-def _is_digit_id(s: str) -> bool:
-    return bool(s and s.isdigit())
 
 def _get_ticket_category(guild: discord.Guild) -> Optional[discord.CategoryChannel]:
     if _is_digit_id(TICKETS_CATEGORY_ID):
