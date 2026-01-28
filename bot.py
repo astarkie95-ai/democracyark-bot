@@ -75,8 +75,17 @@ SERVER_STATUS_CHANNEL_ID = os.getenv("SERVER_STATUS_CHANNEL_ID", "14659020953278
 SERVER_STATUS_MESSAGE_ID = os.getenv("SERVER_STATUS_MESSAGE_ID", "").strip()     # message id to keep editing (optional)
 SERVER_ANNOUNCE_CHANNEL_ID = os.getenv("SERVER_ANNOUNCE_CHANNEL_ID", "").strip() # (legacy) alerts channel id (optional)
 SERVER_ALERTS_CHANNEL_ID = os.getenv("SERVER_ALERTS_CHANNEL_ID", "1465903053461786698").strip()# dedicated alerts channel id (optional)
-SERVER_PING_ROLE_ID = os.getenv("SERVER_PING_ROLE_ID", "").strip()               # role id to ping (optional)
-SERVER_PING_ROLE_NAMES = os.getenv("SERVER_PING_ROLE_NAMES", "").strip()          # optional: comma-separated role names to ping
+
+# ✅ NEW: ping roles (use IDs, not names)
+# Default pings: Owner/Admin/Moderator/Members (you can override in Railway)
+SERVER_PING_ROLE_IDS = os.getenv(
+    "SERVER_PING_ROLE_IDS",
+    "1461514415559147725,1461514871396106404,1461515030800629915,1465022269456646336",
+).strip()
+
+# Back-compat (optional): single role id or role names (not recommended)
+SERVER_PING_ROLE_ID = os.getenv("SERVER_PING_ROLE_ID", "").strip()
+SERVER_PING_ROLE_NAMES = os.getenv("SERVER_PING_ROLE_NAMES", "").strip()
 
 # (Optional) Set SERVER_ALERTS_CHANNEL_ID to post status change alerts to a dedicated channel.
 
@@ -445,7 +454,10 @@ def _parse_id_set(csv_ids: str) -> Set[int]:
             out.add(int(part))
     return out
 
-STAFF_ROLE_IDS: Set[int] = _parse_id_set(STAFF_ROLE_IDS_ENV)
+# Default staff roles (Owner/Admin/Moderator) — used for /serverpanel if STAFF_ROLE_IDS isn't set
+_DEFAULT_STAFF_ROLE_IDS: Set[int] = {1461514415559147725, 1461514871396106404, 1461515030800629915}
+
+STAFF_ROLE_IDS: Set[int] = _parse_id_set(STAFF_ROLE_IDS_ENV) or set(_DEFAULT_STAFF_ROLE_IDS)
 
 def is_staff_member(member: discord.Member) -> bool:
     # Staff if has any configured staff role OR has admin perms
@@ -461,6 +473,50 @@ def is_staff_member(member: discord.Member) -> bool:
             return True
     return False
 
+
+def _parse_id_list(s: str) -> List[int]:
+    out: List[int] = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.isdigit():
+            out.append(int(part))
+    # de-dupe, preserve order
+    seen = set()
+    uniq: List[int] = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+def _build_server_ping(guild: discord.Guild) -> str:
+    """Return a ping string for server alerts (role mentions), or empty string."""
+    role_ids: List[int] = _parse_id_list(SERVER_PING_ROLE_IDS)
+
+    # Back-compat: single role id
+    if not role_ids and _is_digit_id(SERVER_PING_ROLE_ID):
+        role_ids = [int(SERVER_PING_ROLE_ID)]
+
+    mentions: List[str] = []
+
+    # Preferred: role IDs
+    for rid in role_ids:
+        role = guild.get_role(rid)
+        if role:
+            mentions.append(role.mention)
+        else:
+            mentions.append(f"<@&{rid}>")
+
+    # Back-compat: role names (optional)
+    if not mentions and SERVER_PING_ROLE_NAMES:
+        wanted = {n.strip().lower() for n in SERVER_PING_ROLE_NAMES.split(",") if n.strip()}
+        for role in getattr(guild, "roles", []):
+            if role and role.name and role.name.strip().lower() in wanted:
+                mentions.append(role.mention)
+
+    return (" ".join(mentions) + " ") if mentions else ""
 # =====================================================================
 # ✅ NEW: Nitrado restart system (Owners-only) - /restartdemocracy
 # =====================================================================
@@ -515,6 +571,63 @@ async def nitrado_restart_call() -> Tuple[bool, str]:
                 body = await resp.text()
                 if 200 <= resp.status < 300:
                     return True, "Restart request sent to Nitrado."
+                return False, f"Nitrado API error {resp.status}: {body[:300]}"
+    except Exception as e:
+        return False, f"Request failed: {repr(e)}"
+
+async def nitrado_start_call() -> Tuple[bool, str]:
+    """
+    Calls Nitrado API to start the gameserver.
+    Requires:
+      - NITRADO_TOKEN
+      - NITRADO_SERVICE_ID (numeric)
+    """
+    if not NITRADO_TOKEN:
+        return False, "NITRADO_TOKEN missing in Railway Variables."
+    if not _is_digit_id(NITRADO_SERVICE_ID):
+        return False, "NITRADO_SERVICE_ID missing/invalid in Railway Variables."
+
+    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers/start"
+    headers = {
+        "Authorization": f"Bearer {NITRADO_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.post(url) as resp:
+                body = await resp.text()
+                if 200 <= resp.status < 300:
+                    return True, "Start request sent to Nitrado."
+                return False, f"Nitrado API error {resp.status}: {body[:300]}"
+    except Exception as e:
+        return False, f"Request failed: {repr(e)}"
+
+
+async def nitrado_stop_call() -> Tuple[bool, str]:
+    """
+    Calls Nitrado API to stop the gameserver.
+    Requires:
+      - NITRADO_TOKEN
+      - NITRADO_SERVICE_ID (numeric)
+    """
+    if not NITRADO_TOKEN:
+        return False, "NITRADO_TOKEN missing in Railway Variables."
+    if not _is_digit_id(NITRADO_SERVICE_ID):
+        return False, "NITRADO_SERVICE_ID missing/invalid in Railway Variables."
+
+    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers/stop"
+    headers = {
+        "Authorization": f"Bearer {NITRADO_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.post(url) as resp:
+                body = await resp.text()
+                if 200 <= resp.status < 300:
+                    return True, "Stop request sent to Nitrado."
                 return False, f"Nitrado API error {resp.status}: {body[:300]}"
     except Exception as e:
         return False, f"Request failed: {repr(e)}"
@@ -983,6 +1096,7 @@ class ServerActionConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
+        # Always ACK the interaction quickly, then do work.
         if not interaction.guild or not interaction.user or not isinstance(interaction.user, discord.Member):
             try:
                 await interaction.response.edit_message(content="❌ Server context required.", view=None)
@@ -997,10 +1111,23 @@ class ServerActionConfirmView(discord.ui.View):
                 pass
             return
 
+        # ✅ ACK immediately to avoid "This interaction failed"
+        acked = False
         try:
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.edit_message(
+                content=f"⏳ Working on **{self.action.upper()}**…",
+                view=None,
+            )
+            acked = True
         except Exception:
-            pass
+            try:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+                acked = True
+            except Exception:
+                acked = False
+
+        if not acked:
+            return
 
         # Announce publicly in server-alerts (or fallback)
         try:
@@ -1009,27 +1136,30 @@ class ServerActionConfirmView(discord.ui.View):
             pass
 
         # Call Nitrado action
-        if self.action == "start":
-            ok, msg = await nitrado_start_call()
-        elif self.action == "stop":
-            ok, msg = await nitrado_stop_call()
-        else:
-            ok, msg = await nitrado_restart_call()
+        try:
+            if self.action == "start":
+                ok, msg = await nitrado_start_call()
+            elif self.action == "stop":
+                ok, msg = await nitrado_stop_call()
+            else:
+                ok, msg = await nitrado_restart_call()
+        except Exception as e:
+            ok, msg = False, f"{type(e).__name__}: {e}"
 
         # Log it (if configured)
         try:
-            await _restart_log(interaction.guild, f"{self.action.upper()} by {interaction.user} ({interaction.user.id}) — {msg}")
+            await _restart_log(
+                interaction.guild,
+                f"{self.action.upper()} by {interaction.user} ({interaction.user.id}) — {msg}",
+            )
         except Exception:
             pass
 
-        # Disable buttons
+        # Send final result to the admin (ephemeral)
         try:
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = True
-            await interaction.edit_original_response(
-                content=("✅ Action triggered." if ok else "❌ Action failed.") + f" {msg}",
-                view=self,
+            await interaction.followup.send(
+                content=("✅ **Action triggered.** " if ok else "❌ **Action failed.** ") + str(msg),
+                ephemeral=True,
             )
         except Exception:
             pass
