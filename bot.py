@@ -80,6 +80,18 @@ SERVER_CONTROL_CHANNEL_ID = os.getenv("SERVER_CONTROL_CHANNEL_ID", "").strip()  
 SERVER_CONTROL_MESSAGE_ID = os.getenv("SERVER_CONTROL_MESSAGE_ID", "").strip()   # message id to keep editing (optional)
 SERVER_CONTROL_PIN = os.getenv("SERVER_CONTROL_PIN", "0").strip().lower() in ("1","true","yes","on")
 
+# ✅ NEW: Starter Kit module panel (no commands needed for players)
+# If *_CHANNEL_ID is blank, defaults to CLAIM_CHANNEL_ID.
+STARTER_PANEL_CHANNEL_ID = os.getenv("STARTER_PANEL_CHANNEL_ID", "").strip()
+STARTER_PANEL_MESSAGE_ID = os.getenv("STARTER_PANEL_MESSAGE_ID", "").strip()
+STARTER_PANEL_PIN = os.getenv("STARTER_PANEL_PIN", "1").strip().lower() in ("1","true","yes","on")
+
+# ✅ NEW: Poll module panel (no commands needed for players)
+# If *_CHANNEL_ID is blank, defaults to VOTE_CHANNEL_ID.
+POLL_PANEL_CHANNEL_ID = os.getenv("POLL_PANEL_CHANNEL_ID", "").strip()
+POLL_PANEL_MESSAGE_ID = os.getenv("POLL_PANEL_MESSAGE_ID", "").strip()
+POLL_PANEL_PIN = os.getenv("POLL_PANEL_PIN", "1").strip().lower() in ("1","true","yes","on")
+
 # ✅ NEW: ping roles (use IDs, not names)
 # Default pings: Owner/Admin/Moderator/Members (you can override in Railway)
 SERVER_PING_ROLE_IDS = os.getenv(
@@ -158,12 +170,26 @@ class DemocracyBot(commands.Bot):
         except Exception:
             print("State load failed:", traceback.format_exc(), flush=True)
 
+
+        # ✅ Poll system: register active poll views so votes work after restarts (DB-backed)
+        try:
+            for ch_id, poll in list(POLL_BY_CHANNEL.items()):
+                if poll and not getattr(poll, "ended", False):
+                    v = PollView(ch_id)
+                    v.build_buttons()
+                    self.add_view(v)
+            print("POLL: persistent views registered", flush=True)
+        except Exception:
+            print("POLL: failed to register persistent views:", traceback.format_exc(), flush=True)
+
         # ✅ Ticket system: register persistent views so buttons/selects work after restarts
         try:
             self.add_view(TicketPanelView())
             self.add_view(TicketControlsView())
             # ✅ Server control panel: register persistent view for 24/7 buttons
             self.add_view(PersistentServerControlView())
+            self.add_view(StarterKitPanelView())
+            self.add_view(PersistentPollPanelView())
             print("TICKETS: persistent views registered", flush=True)
         except Exception:
             print("TICKETS: failed to register views:", traceback.format_exc(), flush=True)
@@ -346,6 +372,28 @@ async def db_init() -> None:
                   , note TEXT NOT NULL
                 );
             """)
+
+            # ✅ NEW: Poll system tables (DB-backed so polls survive restarts)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS polls (
+                    message_id BIGINT PRIMARY KEY,
+                    channel_id BIGINT NOT NULL,
+                    question TEXT NOT NULL,
+                    options TEXT NOT NULL, -- newline-separated
+                    ended BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at BIGINT NOT NULL,
+                    ended_at BIGINT
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS poll_votes (
+                    message_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    option_index INTEGER NOT NULL,
+                    voted_at BIGINT NOT NULL,
+                    PRIMARY KEY (message_id, user_id)
+                );
+            """)
             print("✅ DB: tables ensured.", flush=True)
             print("✅ DB: ticket tables ensured.", flush=True)
 
@@ -431,7 +479,85 @@ async def db_append_reset_log(admin_id: int, box: int, user_id: int, pin: str, r
             int(user_id),
             str(pin),
             str(reason) if reason is not None else "",
+        )# -----------------------
+# ✅ NEW: Poll DB helpers (polls survive restarts)
+# -----------------------
+async def db_load_active_polls() -> List[Dict[str, Any]]:
+    """Load active (not ended) polls and their votes from DB."""
+    if DB_POOL is None:
+        return []
+    polls: List[Dict[str, Any]] = []
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT message_id, channel_id, question, options, ended FROM polls WHERE ended = FALSE;")
+        for r in rows:
+            mid = int(r["message_id"])
+            votes_rows = await conn.fetch("SELECT user_id, option_index FROM poll_votes WHERE message_id=$1;", mid)
+            votes = {}
+            for vr in votes_rows:
+                try:
+                    votes[int(vr["user_id"])] = int(vr["option_index"])
+                except Exception:
+                    continue
+            polls.append({
+                "message_id": mid,
+                "channel_id": int(r["channel_id"]),
+                "question": str(r["question"] or ""),
+                "options": [o for o in str(r["options"] or "").splitlines() if o.strip()],
+                "votes": votes,
+                "ended": bool(r["ended"]),
+            })
+    return polls
+
+async def db_upsert_poll(message_id: int, channel_id: int, question: str, options: List[str], ended: bool = False) -> None:
+    if DB_POOL is None:
+        return
+    opts = "\n".join([str(o).strip() for o in (options or []) if str(o).strip()])
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO polls (message_id, channel_id, question, options, ended, created_at)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (message_id) DO UPDATE SET
+              channel_id=EXCLUDED.channel_id,
+              question=EXCLUDED.question,
+              options=EXCLUDED.options,
+              ended=EXCLUDED.ended;
+            """,
+            int(message_id), int(channel_id), str(question or ""), str(opts), bool(ended), int(time.time())
         )
+
+async def db_set_poll_ended(message_id: int, ended: bool = True) -> None:
+    if DB_POOL is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "UPDATE polls SET ended=$2, ended_at=$3 WHERE message_id=$1;",
+            int(message_id), bool(ended), int(time.time()) if ended else None
+        )
+
+async def db_delete_poll(message_id: int) -> None:
+    if DB_POOL is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM poll_votes WHERE message_id=$1;", int(message_id))
+            await conn.execute("DELETE FROM polls WHERE message_id=$1;", int(message_id))
+
+async def db_record_poll_vote(message_id: int, user_id: int, option_index: int) -> None:
+    if DB_POOL is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO poll_votes (message_id, user_id, option_index, voted_at)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (message_id, user_id) DO UPDATE SET
+              option_index=EXCLUDED.option_index,
+              voted_at=EXCLUDED.voted_at;
+            """,
+            int(message_id), int(user_id), int(option_index), int(time.time())
+        )
+
 
 # -----------------------
 # Data models
@@ -870,6 +996,7 @@ def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
 
     e = discord.Embed(
         title="📡 Democracy Bot — Nitrado Server Status",
+        color=0x2ECC71,
         description=module,
     )
 
@@ -996,6 +1123,7 @@ async def nitrado_status_loop():
             await msg.edit(
                 embed=discord.Embed(
                     title="📡 Democracy Bot — Nitrado Server Status",
+                    color=0x2ECC71,
                     description=f"```ansi\n⟦ STATUS TEMPORARILY UNAVAILABLE ⟧\nError: {payload.get('error','unknown')}\n```",
                 )
             )
@@ -1207,6 +1335,7 @@ def _build_control_panel_embed() -> discord.Embed:
     )
     e = discord.Embed(
         title="🛠 Democracy Bot — Server Control Panel",
+        color=0xE67E22,
         description=box,
     )
     e.timestamp = datetime.utcnow()
@@ -1404,6 +1533,468 @@ async def _announce_server_action(guild: discord.Guild, action: str, message: st
         await ch.send(content=ping, embed=e, allowed_mentions=_alert_allowed_mentions())
     except Exception:
         pass
+# =====================================================================
+# ✅ NEW: Starter Kit + Poll MODULE PANELS (no commands needed for players)
+# =====================================================================
+
+_STARTER_PANEL_MESSAGE_ID_RUNTIME: int = int(STARTER_PANEL_MESSAGE_ID) if _is_digit_id(STARTER_PANEL_MESSAGE_ID) else 0
+_POLL_PANEL_MESSAGE_ID_RUNTIME: int = int(POLL_PANEL_MESSAGE_ID) if _is_digit_id(POLL_PANEL_MESSAGE_ID) else 0
+
+def _module_box(header: str, lines: List[str]) -> str:
+    """Pretty ANSI-style module box with a unique header."""
+    safe_lines = [str(x) for x in (lines or [])]
+    body = "\n".join(safe_lines)
+    return (
+        "```ansi\n"
+        f"⟦ {header} ⟧\n"
+        f"{body}\n"
+        "```"
+    )
+
+def _starter_panel_channel_id() -> str:
+    return STARTER_PANEL_CHANNEL_ID if _is_digit_id(STARTER_PANEL_CHANNEL_ID) else CLAIM_CHANNEL_ID
+
+def _poll_panel_channel_id() -> str:
+    """Where the Poll MODULE PANEL message lives."""
+    return POLL_PANEL_CHANNEL_ID if _is_digit_id(POLL_PANEL_CHANNEL_ID) else VOTE_CHANNEL_ID
+
+def _poll_vote_channel_id() -> str:
+    """Where polls are actually posted and voted on (defaults to VOTE_CHANNEL_ID)."""
+    return VOTE_CHANNEL_ID if _is_digit_id(VOTE_CHANNEL_ID) else _poll_panel_channel_id()
+
+def _build_starter_panel_embed() -> discord.Embed:
+    lines = [
+        "🎁 Claim your starter kit without commands.",
+        "",
+        f"Available kits : {len(PINS_POOL)}",
+        "One per person : enabled",
+        "",
+        "Press **Claim Starter Kit** to receive your box + PIN privately.",
+    ]
+    e = discord.Embed(
+        title="🎁 Democracy Bot — Starter Kit Module",
+        description=_module_box("STARTER KIT MODULE", lines),
+        color=0xF1C40F,
+    )
+    e.set_footer(text="If kits are out of stock, ask an admin to restock the pool.")
+    e.timestamp = datetime.utcnow()
+    return e
+
+class StarterKitPanelView(discord.ui.View):
+    """Persistent view for the Starter Kit module panel."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _claim(self, interaction: discord.Interaction):
+        # Mirror /claimstarter behavior (same channel rules)
+        if not interaction.user:
+            return
+
+        # Enforce claim channel if configured
+        allowed_ch = _starter_panel_channel_id()
+        if not _only_in_channel(interaction, allowed_ch):
+            await _wrong_channel(interaction, "#claim-starter-kit")
+            return
+
+        uid = interaction.user.id
+
+        # One per person check
+        if uid in CLAIMS:
+            box, pin = CLAIMS[uid]
+            try:
+                await interaction.response.send_message(
+                    f"✅ You already claimed a kit.\n**Your box:** #{box}\n**Your PIN:** `{pin}`",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+        if not PINS_POOL:
+            try:
+                await interaction.response.send_message(
+                    "❌ No starter kits available right now.\nAsk an admin to restock.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+        # Pick lowest box number available
+        box = sorted(PINS_POOL.keys())[0]
+        bp = PINS_POOL.pop(box)
+
+        await save_pool_state()
+        CLAIMS[uid] = (bp.box, bp.pin)
+        await save_claims_only()
+
+        msg = (
+            f"🎁 Starter kit claimed!\n"
+            f"**Your box:** #{bp.box}\n"
+            f"**Your PIN:** `{bp.pin}`\n\n"
+            f"Go to the Community Hub and unlock **Box #{bp.box}** with that PIN."
+        )
+
+        # Ephemeral + DM fallback
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+        try:
+            await interaction.user.send(msg)
+        except Exception:
+            pass
+
+        # Refresh panel counts
+        try:
+            if interaction.guild:
+                await refresh_starter_panel(interaction.guild)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Claim Starter Kit", style=discord.ButtonStyle.primary, custom_id="starterpanel_claim")
+    async def claim_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._claim(interaction)
+
+    @discord.ui.button(label="My Kit", style=discord.ButtonStyle.secondary, custom_id="starterpanel_mykit")
+    async def mykit_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.user:
+            return
+        uid = interaction.user.id
+        if uid in CLAIMS:
+            box, pin = CLAIMS[uid]
+            try:
+                await interaction.response.send_message(
+                    f"✅ Your kit:\n**Box:** #{box}\n**PIN:** `{pin}`",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await interaction.response.send_message(
+                    "ℹ️ You haven't claimed a starter kit yet.\nPress **Claim Starter Kit**.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Pool Count (Admin)", style=discord.ButtonStyle.success, custom_id="starterpanel_poolcount")
+    async def poolcount_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not is_admin(interaction):
+            try:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.send_message(pool_counts(), ephemeral=True)
+        except Exception:
+            pass
+
+async def _ensure_panel_message(
+    guild: discord.Guild,
+    channel_id_str: str,
+    message_id_runtime_name: str,
+    embed: discord.Embed,
+    view: discord.ui.View,
+    pin: bool = False,
+) -> Optional[int]:
+    """Generic helper used by module panels."""
+    ch = await _get_text_channel(guild, channel_id_str)
+    if not ch:
+        return None
+
+    current_id = globals().get(message_id_runtime_name, 0) or 0
+    if current_id:
+        try:
+            msg = await ch.fetch_message(int(current_id))
+            await msg.edit(embed=embed, view=view)
+            return int(msg.id)
+        except Exception:
+            pass
+
+    try:
+        msg = await ch.send(embed=embed, view=view)
+        if pin:
+            try:
+                await msg.pin(reason="Democracy Bot: module panel")
+            except Exception:
+                pass
+        return int(msg.id)
+    except Exception:
+        return None
+
+async def ensure_starter_panel(guild: discord.Guild) -> None:
+    global _STARTER_PANEL_MESSAGE_ID_RUNTIME
+
+    ch_id = _starter_panel_channel_id()
+    if not _is_digit_id(ch_id):
+        return
+
+    msg_id = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=ch_id,
+        message_id_runtime_name="_STARTER_PANEL_MESSAGE_ID_RUNTIME",
+        embed=_build_starter_panel_embed(),
+        view=StarterKitPanelView(),
+        pin=STARTER_PANEL_PIN,
+    )
+    if msg_id and msg_id != _STARTER_PANEL_MESSAGE_ID_RUNTIME:
+        _STARTER_PANEL_MESSAGE_ID_RUNTIME = msg_id
+        print(f"[STARTER] New STARTER_PANEL_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
+
+async def refresh_starter_panel(guild: discord.Guild) -> None:
+    """Update the Starter panel embed in-place (keeps counts accurate)."""
+    global _STARTER_PANEL_MESSAGE_ID_RUNTIME
+    if not _STARTER_PANEL_MESSAGE_ID_RUNTIME:
+        return
+    ch_id = _starter_panel_channel_id()
+    ch = await _get_text_channel(guild, ch_id)
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(int(_STARTER_PANEL_MESSAGE_ID_RUNTIME))
+        await msg.edit(embed=_build_starter_panel_embed(), view=StarterKitPanelView())
+    except Exception:
+        pass
+
+
+# -----------------------
+# ✅ Poll module panel (create polls without commands)
+# -----------------------
+
+def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Embed:
+    if active and not active.ended:
+        counts = _poll_counts(active)
+        total = sum(counts)
+        lines = [
+            "📊 Create and manage polls from this panel.",
+            "",
+            "Active poll : YES",
+            f"Question    : {active.question[:80]}",
+            f"Total votes : {total}",
+            "",
+            "Admins: **Create Poll** | **End Poll**",
+        ]
+    else:
+        lines = [
+            "📊 Create and manage polls from this panel.",
+            "",
+            "Active poll : NO",
+            "",
+            "Admins: Press **Create Poll** to start a poll.",
+            "Players: vote on the poll message that appears below.",
+        ]
+
+    e = discord.Embed(
+        title="📊 Democracy Bot — Poll Module",
+        description=_module_box("POLL MODULE", lines),
+        color=0x3498DB,
+    )
+    e.set_footer(text="This is the no-command way to run polls in #vote.")
+    e.timestamp = datetime.utcnow()
+    return e
+
+class PollCreateModal(discord.ui.Modal, title="Create a poll"):
+    question = discord.ui.TextInput(label="Poll question", required=True, max_length=200)
+    options = discord.ui.TextInput(
+        label="Options (one per line, 2-10)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1500,
+        placeholder="Option 1\nOption 2\nOption 3",
+    )
+
+    def __init__(self, channel_id: int):
+        super().__init__()
+        self.channel_id = int(channel_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            try:
+                await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        if not is_admin(interaction):
+            try:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        q = str(self.question.value or "").strip()
+        opts = [o.strip() for o in str(self.options.value or "").splitlines() if o.strip()]
+        if len(opts) < 2:
+            try:
+                await interaction.response.send_message("❌ Please provide at least 2 options.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        opts = opts[:10]
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        ok, msg = await create_poll_in_channel(interaction.guild, self.channel_id, q, opts, created_by=interaction.user)
+        try:
+            await interaction.followup.send(("✅ " if ok else "❌ ") + msg, ephemeral=True)
+        except Exception:
+            pass
+
+        try:
+            await refresh_poll_panel(interaction.guild, self.channel_id)
+        except Exception:
+            pass
+
+class PersistentPollPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Create Poll (Admin)", style=discord.ButtonStyle.primary, custom_id="pollpanel_create")
+    async def create_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.guild:
+            try:
+                await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        if not is_admin(interaction):
+            try:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        ch_id_str = _poll_vote_channel_id()
+        if not _is_digit_id(ch_id_str):
+            try:
+                await interaction.response.send_message("❌ Poll channel not configured.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        try:
+            await interaction.response.send_modal(PollCreateModal(channel_id=int(ch_id_str)))
+        except Exception as e:
+            try:
+                await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Results", style=discord.ButtonStyle.secondary, custom_id="pollpanel_results")
+    async def results_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.guild:
+            return
+        ch_id_str = _poll_vote_channel_id()
+        if not _is_digit_id(ch_id_str):
+            try:
+                await interaction.response.send_message("❌ Poll channel not configured.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        channel_id = int(ch_id_str)
+        poll = POLL_BY_CHANNEL.get(channel_id)
+        if not poll:
+            try:
+                await interaction.response.send_message("ℹ️ No poll found in #vote.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.send_message(poll_results_text(poll), ephemeral=True)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="End Poll (Admin)", style=discord.ButtonStyle.danger, custom_id="pollpanel_end")
+    async def end_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.guild:
+            return
+        if not is_admin(interaction):
+            try:
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        ch_id_str = _poll_vote_channel_id()
+        if not _is_digit_id(ch_id_str):
+            try:
+                await interaction.response.send_message("❌ Poll channel not configured.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        channel_id = int(ch_id_str)
+        poll = POLL_BY_CHANNEL.get(channel_id)
+        if not poll or poll.ended:
+            try:
+                await interaction.response.send_message("ℹ️ No active poll to end.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        poll.ended = True
+        try:
+            await db_set_poll_ended(poll.message_id, True)
+        except Exception:
+            pass
+
+        try:
+            ch = await _get_text_channel(interaction.guild, str(poll.channel_id))
+            if ch:
+                msg = await ch.fetch_message(poll.message_id)
+                await msg.edit(embed=poll_embed(poll), view=None)
+        except Exception:
+            pass
+
+        try:
+            await interaction.response.send_message("✅ Poll ended.", ephemeral=True)
+        except Exception:
+            pass
+
+        try:
+            await refresh_poll_panel(interaction.guild, channel_id)
+        except Exception:
+            pass
+
+async def ensure_poll_panel(guild: discord.Guild) -> None:
+    global _POLL_PANEL_MESSAGE_ID_RUNTIME
+
+    ch_id = _poll_panel_channel_id()
+    if not _is_digit_id(ch_id):
+        return
+
+    active = POLL_BY_CHANNEL.get(int(_poll_vote_channel_id()))
+    msg_id = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=ch_id,
+        message_id_runtime_name="_POLL_PANEL_MESSAGE_ID_RUNTIME",
+        embed=_build_poll_panel_embed(active if active and not active.ended else None),
+        view=PersistentPollPanelView(),
+        pin=POLL_PANEL_PIN,
+    )
+    if msg_id and msg_id != _POLL_PANEL_MESSAGE_ID_RUNTIME:
+        _POLL_PANEL_MESSAGE_ID_RUNTIME = msg_id
+        print(f"[POLL] New POLL_PANEL_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
+
+async def refresh_poll_panel(guild: discord.Guild, vote_channel_id: int) -> None:
+    global _POLL_PANEL_MESSAGE_ID_RUNTIME
+    if not _POLL_PANEL_MESSAGE_ID_RUNTIME:
+        return
+    ch_id = _poll_panel_channel_id()
+    ch = await _get_text_channel(guild, ch_id)
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(int(_POLL_PANEL_MESSAGE_ID_RUNTIME))
+        active = POLL_BY_CHANNEL.get(int(vote_channel_id))
+        await msg.edit(embed=_build_poll_panel_embed(active if active and not active.ended else None), view=PersistentPollPanelView())
+    except Exception:
+        pass
+
 # -----------------------
 # ✅ NEW: Helpers — enforce specific channels for commands
 # -----------------------
@@ -1541,6 +2132,26 @@ async def load_state() -> None:
     if DB_POOL is not None:
         PINS_POOL = await db_load_pins_pool()
         CLAIMS = await db_load_claims_state()
+        # ✅ NEW: preload active polls so votes and results survive restarts
+        try:
+            polls = await db_load_active_polls()
+            for p in polls:
+                try:
+                    ch_id = int(p.get("channel_id") or 0)
+                    if not ch_id:
+                        continue
+                    POLL_BY_CHANNEL[ch_id] = PollState(
+                        message_id=int(p.get("message_id") or 0),
+                        channel_id=ch_id,
+                        question=str(p.get("question") or ""),
+                        options=list(p.get("options") or []),
+                        votes=dict(p.get("votes") or {}),
+                        ended=bool(p.get("ended")),
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            pass
         return
 
     # Fallback to CSV
@@ -1603,8 +2214,11 @@ async def on_ready():
     try:
         for g in bot.guilds:
             await ensure_server_control_panel(g)
+            # ✅ NEW: ensure Starter Kit + Poll panels exist (no-command modules)
+            await ensure_starter_panel(g)
+            await ensure_poll_panel(g)
     except Exception:
-        print("SERVERCTL: ensure panel failed:", traceback.format_exc(), flush=True)
+        print("MODULES: ensure panels failed:", traceback.format_exc(), flush=True)
 
 def _render_welcome_message(mention: str) -> str:
     template = (WELCOME_MESSAGE or DEFAULT_WELCOME_MESSAGE).strip()
@@ -1669,6 +2283,7 @@ async def serverpanel(interaction: discord.Interaction):
     view = ServerControlView(requester_id=interaction.user.id)
     e = discord.Embed(
         title="🛠 Democracy Bot — Server Control Panel",
+        color=0xE67E22,
         description=(
             "Choose an action below. You will be asked for an announcement message, then asked to confirm.\n\n"
             "Actions:\n"
@@ -1764,12 +2379,12 @@ async def dbstatus(interaction: discord.Interaction):
                 SELECT table_name
                 FROM information_schema.tables
                 WHERE table_schema = 'public'
-                  AND table_name IN ('pins_pool', 'claims', 'resets', 'tickets', 'ticket_events', 'ticket_notes');
+                  AND table_name IN ('pins_pool', 'claims', 'resets', 'tickets', 'ticket_events', 'ticket_notes', 'polls', 'poll_votes');
                 """
             )
         host, dbname = _safe_db_info(LAST_DB_URL or DATABASE_URL)
         found = {r["table_name"] for r in tables}
-        missing = sorted({"pins_pool", "claims", "resets", "tickets", "ticket_events", "ticket_notes"} - found)
+        missing = sorted({"pins_pool", "claims", "resets", "tickets", "ticket_events", "ticket_notes", "polls", "poll_votes"} - found)
         table_line = "all present" if not missing else f"missing: {', '.join(missing)}"
         await interaction.response.send_message(
             "DB: ✅ Connected.\n"
@@ -1824,6 +2439,13 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
     PINS_POOL[box] = BoxPin(box=box, pin=pin)
     await save_pool_state()
 
+    # ✅ keep Starter Kit module panel counts accurate
+    try:
+        if interaction.guild:
+            await refresh_starter_panel(interaction.guild)
+    except Exception:
+        pass
+
     await interaction.response.send_message(
         f"✅ Added starter kit to pool.\n**Box:** #{box}\n**PIN:** `{pin}`\n\n{pool_counts()}",
         ephemeral=True
@@ -1870,6 +2492,13 @@ async def addpinsbulk(interaction: discord.Interaction, lines: str):
         added += 1
 
     await save_pool_state()
+
+    # ✅ keep Starter Kit module panel counts accurate
+    try:
+        if interaction.guild:
+            await refresh_starter_panel(interaction.guild)
+    except Exception:
+        pass
 
     await interaction.response.send_message(
         f"✅ Bulk add complete.\nAdded: **{added}** | Skipped: **{skipped}**\n\n{pool_counts()}",
@@ -2021,6 +2650,13 @@ async def claimstarter(interaction: discord.Interaction):
     CLAIMS[uid] = (bp.box, bp.pin)
     await save_claims_only()
 
+    # ✅ keep Starter Kit module panel counts accurate
+    try:
+        if interaction.guild:
+            await refresh_starter_panel(interaction.guild)
+    except Exception:
+        pass
+
     await interaction.response.send_message(
         f"🎁 Starter kit claimed!\n"
         f"**Your box:** #{bp.box}\n"
@@ -2032,6 +2668,8 @@ async def claimstarter(interaction: discord.Interaction):
 
 # -----------------------
 # POLL (UPDATED: no 1.1 / 2.2, and live public vote counters)
+# -----------------------
+# ✅ Poll system (DB-backed so polls survive restarts)
 # -----------------------
 @dataclass
 class PollState:
@@ -2048,109 +2686,39 @@ POLL_BY_CHANNEL: Dict[int, PollState] = {}
 POLL_LOCKS: Dict[int, asyncio.Lock] = {}
 
 def _get_poll_lock(channel_id: int) -> asyncio.Lock:
-    lock = POLL_LOCKS.get(channel_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        POLL_LOCKS[channel_id] = lock
-    return lock
+    if channel_id not in POLL_LOCKS:
+        POLL_LOCKS[channel_id] = asyncio.Lock()
+    return POLL_LOCKS[channel_id]
 
 def _poll_counts(poll: PollState) -> List[int]:
     counts = [0] * len(poll.options)
-    for idx in poll.votes.values():
-        if 0 <= idx < len(counts):
-            counts[idx] += 1
+    for _uid, idx in (poll.votes or {}).items():
+        if 0 <= int(idx) < len(counts):
+            counts[int(idx)] += 1
     return counts
 
 def poll_embed(poll: PollState) -> discord.Embed:
     counts = _poll_counts(poll)
     total = sum(counts)
 
-    e = discord.Embed(
-        title="📊 Poll" + (" (Closed)" if poll.ended else ""),
-        description=poll.question,
-    )
-
-    # Public, live counts
-    lines = []
+    status = "🔒 CLOSED" if poll.ended else "🟢 OPEN"
+    lines = [
+        f"Status      : {status}",
+        f"Total votes : {total}",
+        "",
+        "Options:",
+    ]
     for i, opt in enumerate(poll.options):
-        lines.append(f"**{i+1}.** {opt} — **{counts[i]}** vote(s)")
-    e.add_field(name=f"Options (Total votes: {total})", value="\n".join(lines), inline=False)
+        lines.append(f"{i+1:>2}. {opt}  —  {counts[i]}")
 
-    e.set_footer(text="Click a button to vote. Admins: /pollresults /pollend /polldelete")
+    e = discord.Embed(
+        title=f"🗳️ Democracy Ark Poll",
+        description=_module_box("VOTE MODULE", [poll.question, ""] + lines),
+        color=0x9B59B6,
+    )
+    e.set_footer(text="Vote using the buttons below. One vote per person; you can change your vote.")
+    e.timestamp = datetime.utcnow()
     return e
-
-class PollView(discord.ui.View):
-    def __init__(self, channel_id: int):
-        super().__init__(timeout=None)
-        self.channel_id = channel_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        poll = POLL_BY_CHANNEL.get(self.channel_id)
-        if not poll or poll.ended:
-            await interaction.response.send_message("This poll is closed.", ephemeral=True)
-            return False
-        return True
-
-    def build_buttons(self):
-        self.clear_items()
-        poll = POLL_BY_CHANNEL.get(self.channel_id)
-        if not poll:
-            return
-
-        counts = _poll_counts(poll)
-
-        for idx in range(len(poll.options)):
-            # Button label ONLY numbers + live count (prevents 1.1 / 2.2)
-            btn = discord.ui.Button(
-                label=f"{idx+1} ({counts[idx]})",
-                style=discord.ButtonStyle.primary,
-                custom_id=f"poll_vote_{self.channel_id}_{idx}",
-            )
-
-            async def callback(interaction: discord.Interaction, option_index=idx):
-                poll2 = POLL_BY_CHANNEL.get(self.channel_id)
-                if not poll2 or poll2.ended:
-                    await interaction.response.send_message("This poll is closed.", ephemeral=True)
-                    return
-
-                # ✅ PATCH: acknowledge instantly so Discord doesn't time out the interaction
-                try:
-                    await interaction.response.defer(ephemeral=True)
-                except Exception:
-                    pass
-
-                # ✅ PATCH: serialize edits so counts always update
-                lock = _get_poll_lock(self.channel_id)
-                async with lock:
-                    # Save vote (one vote per user; changing vote is allowed)
-                    poll2.votes[interaction.user.id] = option_index
-
-                    # ✅ PATCH: ALWAYS edit the real poll message by ID (most reliable)
-                    try:
-                        channel = bot.get_channel(poll2.channel_id)
-                        if channel is None:
-                            channel = await bot.fetch_channel(poll2.channel_id)
-
-                        msg = await channel.fetch_message(poll2.message_id)
-
-                        view = PollView(self.channel_id)
-                        view.build_buttons()
-
-                        await msg.edit(embed=poll_embed(poll2), view=view)
-                    except Exception as e:
-                        print("Poll message edit failed:", repr(e))
-
-                # Ephemeral confirmation to the voter
-                try:
-                    await interaction.followup.send(
-                        f"✅ Vote saved: **{poll2.options[option_index]}**",
-                        ephemeral=True,
-                    )
-                except Exception:
-                    pass
-
-            btn.callback = callback
-            self.add_item(btn)
 
 def poll_results_text(poll: PollState) -> str:
     counts = _poll_counts(poll)
@@ -2159,6 +2727,141 @@ def poll_results_text(poll: PollState) -> str:
     for i, opt in enumerate(poll.options):
         out.append(f"**{i+1}. {opt}** — {counts[i]}")
     return "\n".join(out)
+
+class PollView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=None)
+        self.channel_id = int(channel_id)
+
+    def build_buttons(self):
+        self.clear_items()
+
+        poll = POLL_BY_CHANNEL.get(self.channel_id)
+        if not poll:
+            return
+        counts = _poll_counts(poll)
+
+        for idx, opt in enumerate(poll.options[:10]):
+            label = f"{idx+1}. {opt}"
+            # Keep label under Discord limit
+            if len(label) > 80:
+                label = label[:77] + "…"
+            if not poll.ended:
+                label = f"{label} ({counts[idx]})"
+            btn = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.primary if not poll.ended else discord.ButtonStyle.secondary,
+                custom_id=f"poll_vote_{self.channel_id}_{idx}",
+                disabled=bool(poll.ended),
+            )
+
+            async def _cb(interaction: discord.Interaction, option_index=idx):
+                await poll_handle_vote(interaction, self.channel_id, int(option_index))
+
+            btn.callback = _cb
+            self.add_item(btn)
+
+async def poll_handle_vote(interaction: discord.Interaction, channel_id: int, option_index: int):
+    if not interaction.user:
+        return
+    poll = POLL_BY_CHANNEL.get(int(channel_id))
+    if not poll:
+        try:
+            await interaction.response.send_message("❌ This poll is no longer available.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    if poll.ended:
+        try:
+            await interaction.response.send_message("🔒 This poll is closed.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    if option_index < 0 or option_index >= len(poll.options):
+        try:
+            await interaction.response.send_message("❌ Invalid option.", ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    lock = _get_poll_lock(int(channel_id))
+    async with lock:
+        poll.votes[int(interaction.user.id)] = int(option_index)
+        try:
+            await db_record_poll_vote(poll.message_id, interaction.user.id, option_index)
+        except Exception:
+            pass
+
+        # Update the public message with new counts
+        try:
+            if interaction.message:
+                view = PollView(channel_id)
+                view.build_buttons()
+                await interaction.message.edit(embed=poll_embed(poll), view=view)
+        except Exception:
+            pass
+
+    # ACK
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("✅ Vote recorded.", ephemeral=True)
+        else:
+            await interaction.followup.send("✅ Vote recorded.", ephemeral=True)
+    except Exception:
+        pass
+
+async def _create_poll_message(channel: discord.TextChannel, question: str, options: List[str]) -> Optional[PollState]:
+    channel_id = int(channel.id)
+
+    existing = POLL_BY_CHANNEL.get(channel_id)
+    if existing and not existing.ended:
+        return None
+
+    poll_state = PollState(
+        message_id=0,
+        channel_id=channel_id,
+        question=str(question or "").strip(),
+        options=[str(o).strip() for o in (options or []) if str(o).strip()][:10],
+        votes={},
+        ended=False,
+    )
+    POLL_BY_CHANNEL[channel_id] = poll_state
+
+    view = PollView(channel_id)
+    view.build_buttons()
+
+    msg = await channel.send(embed=poll_embed(poll_state), view=view)
+    poll_state.message_id = int(msg.id)
+
+    # DB
+    try:
+        await db_upsert_poll(poll_state.message_id, poll_state.channel_id, poll_state.question, poll_state.options, ended=False)
+    except Exception:
+        pass
+
+    return poll_state
+
+async def create_poll_in_channel(guild: discord.Guild, channel_id: int, question: str, options: List[str], created_by: Optional[discord.abc.User] = None) -> Tuple[bool, str]:
+    ch = await _get_text_channel(guild, str(channel_id))
+    if not ch:
+        return False, "Vote channel not found."
+    if not isinstance(ch, discord.TextChannel):
+        return False, "Vote channel is not a text channel."
+
+    existing = POLL_BY_CHANNEL.get(int(channel_id))
+    if existing and not existing.ended:
+        return False, "There is already an active poll in #vote. End it first."
+
+    try:
+        poll = await _create_poll_message(ch, question, options)
+    except Exception as e:
+        return False, f"Failed to create poll: {repr(e)}"
+
+    if not poll:
+        return False, "There is already an active poll in #vote. End it first."
+
+    who = f" by {created_by.mention}" if created_by else ""
+    return True, f"Poll created{who}."
 
 @bot.tree.command(name="poll", description="Admin: Create a poll with up to 10 options.")
 @app_commands.describe(
@@ -2196,16 +2899,7 @@ async def poll_create(
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
-    if not interaction.channel:
-        return
-
-    channel_id = interaction.channel.id
-    existing = POLL_BY_CHANNEL.get(channel_id)
-    if existing and not existing.ended:
-        await interaction.response.send_message(
-            "⚠️ There is already an active poll in this channel.\nUse `/pollend` or `/polldelete`.",
-            ephemeral=True,
-        )
+    if not interaction.channel or not interaction.guild:
         return
 
     options = [option1.strip(), option2.strip()]
@@ -2213,22 +2907,31 @@ async def poll_create(
         if opt and opt.strip():
             options.append(opt.strip())
 
-    poll_state = PollState(
-        message_id=0,
-        channel_id=channel_id,
-        question=question.strip(),
-        options=options[:10],
-        votes={},
-        ended=False,
-    )
-    POLL_BY_CHANNEL[channel_id] = poll_state
+    # Create the poll message publicly
+    try:
+        poll = await _create_poll_message(interaction.channel, question.strip(), options)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to create poll: {repr(e)}", ephemeral=True)
+        return
 
-    view = PollView(channel_id)
-    view.build_buttons()
+    if not poll:
+        await interaction.response.send_message(
+            "⚠️ There is already an active poll in this channel.\nUse `/pollend` or `/polldelete`.",
+            ephemeral=True,
+        )
+        return
 
-    await interaction.response.send_message(embed=poll_embed(poll_state), view=view)
-    msg = await interaction.original_response()
-    poll_state.message_id = msg.id
+    # Use original_response style (as before) so it feels instant
+    try:
+        await interaction.response.send_message("✅ Poll created.", ephemeral=True)
+    except Exception:
+        pass
+
+    # Refresh poll panel
+    try:
+        await refresh_poll_panel(interaction.guild, int(interaction.channel.id))
+    except Exception:
+        pass
 
 @bot.tree.command(name="pollresults", description="Admin: Show results for the current poll in this channel.")
 async def poll_results(interaction: discord.Interaction):
@@ -2258,7 +2961,7 @@ async def poll_end(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
-    if not interaction.channel:
+    if not interaction.channel or not interaction.guild:
         return
     poll = POLL_BY_CHANNEL.get(interaction.channel.id)
     if not poll:
@@ -2266,7 +2969,12 @@ async def poll_end(interaction: discord.Interaction):
         return
     poll.ended = True
 
-    # Try to update the public message to show closed + final counts
+    try:
+        await db_set_poll_ended(poll.message_id, True)
+    except Exception:
+        pass
+
+    # Update the public message to show closed + final counts
     try:
         msg = await interaction.channel.fetch_message(poll.message_id)
         await msg.edit(embed=poll_embed(poll), view=None)
@@ -2274,6 +2982,11 @@ async def poll_end(interaction: discord.Interaction):
         pass
 
     await interaction.response.send_message("✅ Poll ended. Voting is now closed.", ephemeral=True)
+
+    try:
+        await refresh_poll_panel(interaction.guild, int(interaction.channel.id))
+    except Exception:
+        pass
 
 @bot.tree.command(name="polldelete", description="Admin: Delete the poll message and remove the poll.")
 async def poll_delete(interaction: discord.Interaction):
@@ -2285,7 +2998,7 @@ async def poll_delete(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Admins only.", ephemeral=True)
         return
-    if not interaction.channel:
+    if not interaction.channel or not interaction.guild:
         return
 
     channel_id = interaction.channel.id
@@ -2301,7 +3014,17 @@ async def poll_delete(interaction: discord.Interaction):
         pass
 
     POLL_BY_CHANNEL.pop(channel_id, None)
+    try:
+        await db_delete_poll(poll.message_id)
+    except Exception:
+        pass
+
     await interaction.response.send_message("🗑️ Poll deleted.", ephemeral=True)
+
+    try:
+        await refresh_poll_panel(interaction.guild, int(interaction.channel.id))
+    except Exception:
+        pass
 
 # =====================================================================
 # FULL TICKET SYSTEM (DB-backed, channel-based, transcripts, staff tools)
@@ -2978,6 +3701,7 @@ async def ticketpanel(interaction: discord.Interaction):
 
     e = discord.Embed(
         title="🎫 Support Tickets",
+        color=0x95A5A6,
         description=(
             "Select a ticket type below to open a private support channel.\n\n"
             "Please include as much detail as you can so staff can help faster."
