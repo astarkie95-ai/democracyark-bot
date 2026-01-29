@@ -2068,261 +2068,199 @@ def _render_starter_admin_box() -> str:
         ],
     )
 
-class _StarterAdminAddModal(discord.ui.Modal, title="Add Starter Vault"):
-    vault_number = discord.ui.TextInput(
-        label="Vault number (optional)",
-        required=False,
-        placeholder="Leave blank to auto-assign next vault #",
-        max_length=10,
-    )
-    vault_pin = discord.ui.TextInput(
-        label="Vault PIN",
-        required=True,
-        placeholder="Digits only (example: 4821)",
-        max_length=16,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        vault_str = (self.vault_number.value or "").strip()
-        pin = (self.vault_pin.value or "").strip()
-
-        if not pin.isdigit():
-            return await interaction.response.send_message("❌ PIN must be digits only.", ephemeral=True)
-
-        # Determine the vault number
-        used_boxes = set(PINS_POOL.keys()) | {b for (b, _p) in CLAIMS.values()}
-        used_pins = {bp.pin for bp in PINS_POOL.values()} | {_p for (_b, _p) in CLAIMS.values()}
-
-        if pin in used_pins:
-            return await interaction.response.send_message("❌ That PIN is already in use.", ephemeral=True)
-
-        if vault_str:
-            if not vault_str.isdigit():
-                return await interaction.response.send_message("❌ Vault number must be digits only.", ephemeral=True)
-            vault_no = int(vault_str)
-            if vault_no <= 0:
-                return await interaction.response.send_message("❌ Vault number must be 1 or higher.", ephemeral=True)
-            if vault_no in used_boxes:
-                return await interaction.response.send_message("❌ That vault number is already in use.", ephemeral=True)
-        else:
-            vault_no = 1
-            while vault_no in used_boxes:
-                vault_no += 1
-
-        PINS_POOL[vault_no] = BoxPin(vault_no, pin)
-        await save_pool_state()
-
-        await interaction.response.send_message(f"✅ Added **Vault #{vault_no}** to the pool.", ephemeral=True)
-
-        # Refresh panels (best-effort)
-        try:
-            if interaction.guild:
-                await ensure_starter_panel(interaction.guild)
-                await ensure_starter_admin_panel(interaction.guild)
-        except Exception:
-            pass
-
-
-class _StarterAdminDeleteModal(discord.ui.Modal, title="Delete Starter Vault"):
-    vault_or_pin = discord.ui.TextInput(
-        label="Vault number or PIN",
-        required=True,
-        placeholder="Example: 4  (vault #)  or  4821 (PIN)",
-        max_length=16,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        token = (self.vault_or_pin.value or "").strip()
-
-        if not token.isdigit():
-            return await interaction.response.send_message("❌ Enter digits only (vault number or PIN).", ephemeral=True)
-
-        claimed_boxes = {b for (b, _p) in CLAIMS.values()}
-        claimed_pins = {_p for (_b, _p) in CLAIMS.values()}
-
-        # Try vault number first
-        vault_no = int(token)
-
-        if vault_no in claimed_boxes:
-            return await interaction.response.send_message("❌ That vault has already been claimed and cannot be deleted.", ephemeral=True)
-
-        if vault_no in PINS_POOL:
-            del PINS_POOL[vault_no]
-            await save_pool_state()
-            await interaction.response.send_message(f"✅ Deleted **Vault #{vault_no}** from the pool.", ephemeral=True)
-        else:
-            # Treat as PIN
-            pin = token
-            if pin in claimed_pins:
-                return await interaction.response.send_message("❌ That PIN has already been claimed and cannot be deleted.", ephemeral=True)
-
-            vault_to_delete = None
-            for k, v in PINS_POOL.items():
-                if v == pin:
-                    vault_to_delete = k
-                    break
-
-            if vault_to_delete is None:
-                return await interaction.response.send_message("❌ Not found in the available pool.", ephemeral=True)
-
-            del PINS_POOL[vault_to_delete]
-            await save_pool_state()
-            await interaction.response.send_message(f"✅ Deleted **Vault #{vault_to_delete}** from the pool.", ephemeral=True)
-
-        # Refresh panels (best-effort)
-        try:
-            if interaction.guild:
-                await ensure_starter_panel(interaction.guild)
-                await ensure_starter_admin_panel(interaction.guild)
-        except Exception:
-            pass
-
 
 class _StarterAdminAddModal(discord.ui.Modal, title="Add Vault"):
-    pin_input = discord.ui.TextInput(
-        label="Vault PIN (numbers only)",
-        placeholder="e.g. 1234",
-        required=True,
+    vault_no = discord.ui.TextInput(
+        label="Vault number (optional)",
+        placeholder="Leave blank to auto-pick next available",
+        required=False,
+        max_length=6,
+    )
+    pin = discord.ui.TextInput(
+        label="Vault PIN (optional)",
+        placeholder="Leave blank to auto-generate",
+        required=False,
         max_length=16,
     )
-
-    def __init__(self, staff_id: int):
-        super().__init__()
-        self.staff_id = staff_id
+    note = discord.ui.TextInput(
+        label="Note (optional)",
+        placeholder="e.g. 'Re-stock batch 1'",
+        required=False,
+        max_length=60,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
-        pin = str(self.pin_input.value).strip()
-        if not pin.isdigit():
-            return await interaction.response.send_message("❌ PIN must be numbers only.", ephemeral=True)
+        if not is_staff_member(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
 
-        if pin in PINS_POOL.values() or any(pin == _p for (_v, _p) in CLAIMS.values()):
-            return await interaction.response.send_message("❌ That PIN is already in use.", ephemeral=True)
+        # Pick vault number
+        raw_no = (self.vault_no.value or "").strip()
+        if raw_no:
+            if not raw_no.isdigit():
+                return await interaction.response.send_message("❌ Vault number must be a number.", ephemeral=True)
+            box_no = int(raw_no)
+            if box_no <= 0:
+                return await interaction.response.send_message("❌ Vault number must be positive.", ephemeral=True)
 
-        next_no = 1
-        if PINS_POOL:
-            next_no = max(PINS_POOL.keys()) + 1
-        if CLAIMS:
-            next_no = max(next_no, max(v for (v, _p) in CLAIMS.values()) + 1)
+            # Prevent collisions with pool or claimed vault numbers
+            claimed_box_nos = {box for (box, _pin) in CLAIMS.values()}
+            if box_no in PINS_POOL or box_no in claimed_box_nos:
+                return await interaction.response.send_message(
+                    f"❌ Vault #{box_no} is already in use (pool or claimed). Pick another number.",
+                    ephemeral=True,
+                )
+        else:
+            used = set(PINS_POOL.keys()) | {box for (box, _pin) in CLAIMS.values()}
+            box_no = 1
+            while box_no in used:
+                box_no += 1
 
-        PINS_POOL[next_no] = pin
-        _save_pool_state()
-        await interaction.response.send_message(f"✅ Added Vault #{next_no}.", ephemeral=True)
+        # Pick PIN
+        raw_pin = (self.pin.value or "").strip()
+        if raw_pin:
+            if not raw_pin.isdigit() or len(raw_pin) < 4:
+                return await interaction.response.send_message(
+                    "❌ PIN must be digits only (at least 4 digits).", ephemeral=True
+                )
+            new_pin = raw_pin
+        else:
+            existing_pins = {bp.pin for bp in PINS_POOL.values()} | {p for (_b, p) in CLAIMS.values()}
+            # generate_new_pin() exists elsewhere in this file
+            new_pin = generate_new_pin()
+            tries = 0
+            while new_pin in existing_pins and tries < 200:
+                new_pin = generate_new_pin()
+                tries += 1
+            if new_pin in existing_pins:
+                return await interaction.response.send_message(
+                    "❌ Could not generate a unique PIN. Try again.", ephemeral=True
+                )
 
-        g = interaction.guild
-        if g:
-            await ensure_starter_panel(g)
-            await ensure_starter_admin_panel(g)
+        bp = BoxPin(box=box_no, pin=new_pin)
+        PINS_POOL[box_no] = bp
+
+        await save_pool_state()
+        await ensure_starter_admin_panel(interaction.guild)
+
+        return await interaction.response.send_message(
+            f"✅ Added vault **#{box_no}** with PIN **{new_pin}**.",
+            ephemeral=True,
+        )
 
 
 class _StarterAdminDeleteModal(discord.ui.Modal, title="Delete Vault"):
-    vault_input = discord.ui.TextInput(
-        label="Vault # to delete (or PIN)",
-        placeholder="e.g. 1",
+    vault_no = discord.ui.TextInput(
+        label="Vault number to delete",
+        placeholder="e.g. 12",
         required=True,
-        max_length=16,
+        max_length=6,
     )
 
-    def __init__(self, staff_id: int):
-        super().__init__()
-        self.staff_id = staff_id
-
     async def on_submit(self, interaction: discord.Interaction):
-        token = str(self.vault_input.value).strip()
+        if not is_staff_member(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
 
-        # Resolve to a vault number (prefer #)
-        vault_no = None
-        if token.isdigit():
-            n = int(token)
-            if n in PINS_POOL:
-                vault_no = n
-            else:
-                # try by PIN in pool
-                for k, v in PINS_POOL.items():
-                    if v == token:
-                        vault_no = k
-                        break
+        raw_no = (self.vault_no.value or "").strip()
+        if not raw_no.isdigit():
+            return await interaction.response.send_message("❌ Vault number must be a number.", ephemeral=True)
+        box_no = int(raw_no)
 
-        if vault_no is None:
-            return await interaction.response.send_message("❌ Vault not found in the available pool.", ephemeral=True)
+        if box_no in PINS_POOL:
+            del PINS_POOL[box_no]
+            await save_pool_state()
+            await ensure_starter_admin_panel(interaction.guild)
+            return await interaction.response.send_message(f"✅ Deleted unclaimed vault **#{box_no}**.", ephemeral=True)
 
-        # Don't allow deleting a claimed vault (use Recycle)
-        claimed_boxes = {v for (v, _p) in CLAIMS.values()}
-        if vault_no in claimed_boxes:
-            return await interaction.response.send_message("❌ That vault is claimed. Use **Recycle Vault** instead.", ephemeral=True)
+        # If it is claimed, we intentionally block "delete" and ask to recycle instead
+        claimed_box_nos = {box for (box, _pin) in CLAIMS.values()}
+        if box_no in claimed_box_nos:
+            return await interaction.response.send_message(
+                f"⚠️ Vault **#{box_no}** is claimed. Use **Recycle Vault** to free and reuse it (owner stays ineligible).",
+                ephemeral=True,
+            )
 
-        PINS_POOL.pop(vault_no, None)
-        _save_pool_state()
-        await interaction.response.send_message(f"🗑️ Deleted Vault #{vault_no}.", ephemeral=True)
-
-        g = interaction.guild
-        if g:
-            await ensure_starter_panel(g)
-            await ensure_starter_admin_panel(g)
+        return await interaction.response.send_message(f"❌ Vault **#{box_no}** not found.", ephemeral=True)
 
 
 class _StarterAdminRecycleModal(discord.ui.Modal, title="Recycle Claimed Vault"):
-    vault_input = discord.ui.TextInput(
-        label="Vault # to recycle (or current PIN)",
-        placeholder="e.g. 1",
+    vault_no = discord.ui.TextInput(
+        label="Vault number to recycle",
+        placeholder="e.g. 12",
+        required=True,
+        max_length=6,
+    )
+    confirm = discord.ui.TextInput(
+        label='Type "RECYCLE" to confirm',
+        placeholder="RECYCLE",
         required=True,
         max_length=16,
     )
 
-    def __init__(self, staff_id: int):
-        super().__init__()
-        self.staff_id = staff_id
-
     async def on_submit(self, interaction: discord.Interaction):
-        token = str(self.vault_input.value).strip()
+        if not is_staff_member(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
 
-        # Find the claim record
-        target_user_id = None
-        target_vault_no = None
-        target_pin = None
+        if (self.confirm.value or "").strip().upper() != "RECYCLE":
+            return await interaction.response.send_message("❌ Confirmation failed. Type RECYCLE to confirm.", ephemeral=True)
 
-        # Prefer vault #
-        if token.isdigit():
-            n = int(token)
-            for uid, (vno, pin) in CLAIMS.items():
-                if vno == n:
-                    target_user_id, target_vault_no, target_pin = uid, vno, pin
-                    break
+        raw_no = (self.vault_no.value or "").strip()
+        if not raw_no.isdigit():
+            return await interaction.response.send_message("❌ Vault number must be a number.", ephemeral=True)
+        box_no = int(raw_no)
 
-        # Fallback: match by PIN
-        if target_user_id is None:
-            for uid, (vno, pin) in CLAIMS.items():
-                if pin == token:
-                    target_user_id, target_vault_no, target_pin = uid, vno, pin
-                    break
+        # Find the claim for this vault number
+        owner_id = None
+        old_pin = None
+        for uid, (b, p) in CLAIMS.items():
+            if b == box_no:
+                owner_id = uid
+                old_pin = p
+                break
 
-        if target_user_id is None:
-            return await interaction.response.send_message("❌ That vault/PIN is not currently claimed.", ephemeral=True)
+        if owner_id is None:
+            # If unclaimed, recycling is not needed (can delete instead)
+            if box_no in PINS_POOL:
+                return await interaction.response.send_message(
+                    f"ℹ️ Vault **#{box_no}** is not claimed (it is in the pool). No need to recycle; use **Delete Vault** if you want to remove it.",
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                f"❌ Vault **#{box_no}** not found in claims or pool.",
+                ephemeral=True,
+            )
 
-        # Remove the claim, but DO NOT remove the user from CLAIMED_USERS
-        CLAIMS.pop(target_user_id, None)
-        _save_claims_state()
+        # Remove active claim but keep the user in CLAIMED_USERS (so they can't claim again)
+        del CLAIMS[owner_id]
+        await save_claims_only()
 
-        # Generate a new unique PIN and return the vault number to the pool
-        new_pin = _generate_unique_pin()
-        PINS_POOL[target_vault_no] = new_pin
-        _save_pool_state()
+        # Generate a new unique pin and put the slot back into the pool
+        existing_pins = {bp.pin for bp in PINS_POOL.values()} | {p for (_b, p) in CLAIMS.values()}
+        new_pin = generate_new_pin()
+        tries = 0
+        while new_pin in existing_pins and tries < 200:
+            new_pin = generate_new_pin()
+            tries += 1
+        if new_pin in existing_pins:
+            return await interaction.response.send_message("❌ Could not generate a unique PIN. Try again.", ephemeral=True)
 
-        # Log for audit trail (optional)
-        try:
-            log_reset(target_vault_no, str(target_pin), str(target_user_id), reason="admin recycle")
-        except Exception:
-            pass
+        PINS_POOL[box_no] = BoxPin(box=box_no, pin=new_pin)
+        await save_pool_state()
 
-        await interaction.response.send_message(
-            f"♻️ Recycled Vault #{target_vault_no}. New PIN generated and returned to pool.\n"
-            "Original claimer remains **ineligible** to claim again.",
-            ephemeral=True
+        await ensure_starter_admin_panel(interaction.guild)
+
+        # Do NOT mention/ping the old owner
+        owner_name = str(owner_id)
+        if interaction.guild:
+            m = interaction.guild.get_member(owner_id)
+            if m:
+                owner_name = m.display_name
+
+        return await interaction.response.send_message(
+            f"✅ Recycled vault **#{box_no}** (old owner: **{owner_name}**). "
+            f"New PIN generated: **{new_pin}**.\n"
+            f"Old owner remains ineligible to claim again.",
+            ephemeral=True,
         )
-
-        g = interaction.guild
-        if g:
-            await ensure_starter_panel(g)
-            await ensure_starter_admin_panel(g)
 
 
 class StarterVaultAdminView(discord.ui.View):
@@ -2330,65 +2268,57 @@ class StarterVaultAdminView(discord.ui.View):
         super().__init__(timeout=None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await is_staff_member(interaction)
+        return is_staff_member(interaction.user)
 
-    @discord.ui.button(label="Add Vault", style=discord.ButtonStyle.success, custom_id="starteradmin_addvault")
-    async def add_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.interaction_check(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        await interaction.response.send_modal(_StarterAdminAddModal(staff_id=interaction.user.id))
-
-    @discord.ui.button(label="Delete Vault", style=discord.ButtonStyle.danger, custom_id="starteradmin_deletevault")
-    async def delete_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.interaction_check(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        await interaction.response.send_modal(_StarterAdminDeleteModal(staff_id=interaction.user.id))
-
-    @discord.ui.button(label="Recycle Vault", style=discord.ButtonStyle.secondary, custom_id="starteradmin_recyclevault")
-    async def recycle_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.interaction_check(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        await interaction.response.send_modal(_StarterAdminRecycleModal(staff_id=interaction.user.id))
-
-    @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starteradmin_viewclaims")
-    async def view_claims(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.interaction_check(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-
-        if not CLAIMS:
-            return await interaction.response.send_message("No claims yet.", ephemeral=True)
-
-        # CLAIMS: {user_id: (vault_no, pin)}
-        items = sorted(CLAIMS.items(), key=lambda kv: kv[1][0])
-
-        # Avoid pinging users
-        guild = interaction.guild
-        lines = []
-        for user_id, (vault_no, _pin) in items:
-            name = str(user_id)
-            if guild:
-                mem = guild.get_member(int(user_id))
-                if mem:
-                    name = mem.display_name
-            lines.append(f"- {name} — Vault #{vault_no}")
-
-        msg = "**Starter vault claims:**\n" + "\n".join(lines)
-        await interaction.response.send_message(
-            msg,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none()
+    def _render_starter_admin_box(self) -> str:
+        avail = len(PINS_POOL)
+        claimed = len(CLAIMS)
+        return (
+            "[ STARTER VAULT ADMIN ]\n"
+            "Admin tools for managing the starter vault pool.\n\n"
+            f"Available vaults : {avail}\n"
+            f"Claimed vaults   : {claimed}\n"
+            "Storage          : Database\n\n"
+            "Use the buttons below to add, delete, view, or recycle vaults.\n"
         )
 
-    @discord.ui.button(label="Pool Count", style=discord.ButtonStyle.secondary, custom_id="starteradmin_poolcount")
-    async def pool_count(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.interaction_check(interaction):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    @discord.ui.button(label="Add Vault", style=discord.ButtonStyle.success, custom_id="starter_admin_add")
+    async def add_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_StarterAdminAddModal())
 
+    @discord.ui.button(label="Delete Vault", style=discord.ButtonStyle.danger, custom_id="starter_admin_delete")
+    async def delete_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_StarterAdminDeleteModal())
+
+    @discord.ui.button(label="Recycle Vault", style=discord.ButtonStyle.secondary, custom_id="starter_admin_recycle")
+    async def recycle_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_StarterAdminRecycleModal())
+
+    @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starter_admin_claims")
+    async def view_claims(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not CLAIMS:
+            return await interaction.response.send_message("No starter vault claims yet.", ephemeral=True)
+
+        lines = []
+        # sort by vault number
+        for uid, (box_no, pin) in sorted(CLAIMS.items(), key=lambda kv: kv[1][0]):
+            name = str(uid)
+            if interaction.guild:
+                m = interaction.guild.get_member(uid)
+                if m:
+                    name = m.display_name
+            lines.append(f"- {name} — Vault #{box_no} — PIN {pin}")
+
+        msg = "Starter vault claims:\n" + "\n".join(lines)
+        await interaction.response.send_message(f"```{msg}```", ephemeral=True)
+
+    @discord.ui.button(label="Pool Count", style=discord.ButtonStyle.secondary, custom_id="starter_admin_poolcount")
+    async def pool_count(self, interaction: discord.Interaction, button: discord.ui.Button):
+        avail = len(PINS_POOL)
         claimed = len(CLAIMS)
-        available = len(PINS_POOL)
         await interaction.response.send_message(
-            f"Available vaults: **{available}**\nClaimed vaults: **{claimed}**",
-            ephemeral=True
+            f"Available vaults: **{avail}**\nClaimed vaults: **{claimed}**",
+            ephemeral=True,
         )
 
 async def ensure_starter_admin_panel(guild: discord.Guild) -> None:
