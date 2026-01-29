@@ -1690,7 +1690,15 @@ class StarterKitPanelView(discord.ui.View):
         CLAIMS[uid] = (bp.box, bp.pin)
         await save_claims_only()
 
-            CLAIMED_USERS.add(uid)
+        # Permanently mark this user as having claimed (even if a vault is later recycled)
+        CLAIMED_USERS.add(uid)
+        if DATABASE_URL and DB_POOL:
+            try:
+                async with DB_POOL.acquire() as con:
+                    await db_mark_user_claimed(con, uid, box=bp.box, pin=bp.pin)
+            except Exception:
+                pass
+        else:
             await save_claimed_users_only()
         msg = (
             f"🎁 Starter kit claimed!\n"
