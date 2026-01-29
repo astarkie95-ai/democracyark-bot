@@ -2042,8 +2042,8 @@ class _StarterAdminAddModal(discord.ui.Modal, title="Add Starter Vault(s)"):
         raw = str(self.pins_text.value or "").strip()
         if not raw:
             return await interaction.response.send_message("❌ Nothing to add.", ephemeral=True)
-
-        used_boxes = set(PINS_POOL.keys()) | set(CLAIMS.keys())
+        claimed_boxes = {bp[0] for bp in CLAIMS.values()}  # CLAIMS: user_id -> (vault_no, pin)
+        used_boxes = set(PINS_POOL.keys()) | claimed_boxes
         used_pins = {bp.pin for bp in PINS_POOL.values()} | {bp.pin for bp in CLAIMS.values()}
 
         def next_box() -> int:
@@ -2101,14 +2101,11 @@ class _StarterAdminAddModal(discord.ui.Modal, title="Add Starter Vault(s)"):
             await save_pool_state()
             # Refresh panels
             try:
-                await ensure_starter_panel()
-                await ensure_starter_admin_panel()
+                if interaction.guild:
+                    await refresh_starter_panel(interaction.guild)
+                    await ensure_starter_admin_panel(interaction.guild)
             except Exception:
-                pass
-            try:
-                await ensure_starter_admin_panel()
-            except Exception:
-                pass
+                print("Starter panels refresh failed:", traceback.format_exc(), flush=True)
 
         msg = []
         if added:
@@ -2165,8 +2162,12 @@ class _StarterAdminDeleteModal(discord.ui.Modal, title="Delete Starter Vault(s)"
                     PINS_POOL.pop(found_box, None)
                     removed.append(f"Vault #{found_box}")
                 else:
-                    if int(t) in CLAIMS:
+                    # If it's a vault number that exists but is claimed, say so
+                    box_num = int(t)
+                    if any((bp[0] == box_num) for bp in CLAIMS.values()):
                         skipped.append(f"{t} (vault is claimed; cannot delete)")
+                    elif any((bp[1] == t) for bp in CLAIMS.values()):
+                        skipped.append(f"{t} (PIN is claimed; cannot delete)")
                     else:
                         skipped.append(f"{t} (not found in available pool)")
                 continue
@@ -2176,13 +2177,11 @@ class _StarterAdminDeleteModal(discord.ui.Modal, title="Delete Starter Vault(s)"
         if removed:
             await save_pool_state()
             try:
-                await ensure_starter_panel()
+                if interaction.guild:
+                    await refresh_starter_panel(interaction.guild)
+                    await ensure_starter_admin_panel(interaction.guild)
             except Exception:
-                pass
-            try:
-                await ensure_starter_admin_panel()
-            except Exception:
-                pass
+                print('Starter panels refresh failed:', traceback.format_exc(), flush=True)
 
         msg = []
         if removed:
@@ -2216,20 +2215,26 @@ class StarterVaultAdminView(discord.ui.View):
     async def delete_vault(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(_StarterAdminDeleteModal())
 
-    @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starteradmin_claims")
+    @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starteradmin_viewclaims")
     async def view_claims(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message("Admins only.", ephemeral=True)
+
         if not CLAIMS:
-            return await interaction.response.send_message("No starter vault claims yet.", ephemeral=True)
+            return await interaction.response.send_message("No starter vaults have been claimed yet.", ephemeral=True)
 
+        # CLAIMS: user_id -> (vault_no, pin)
         rows = []
-        for box in sorted(CLAIMS.keys()):
-            claim = CLAIMS[box]
-            user_mention = f"<@{claim.user_id}>"
-            rows.append(f"{user_mention} — Vault #{box}")
+        for uid, (box, _pin) in sorted(CLAIMS.items(), key=lambda kv: kv[1][0]):
+            if interaction.guild:
+                member = interaction.guild.get_member(uid)
+                mention = member.mention if member else f"<@{uid}>"
+            else:
+                mention = f"<@{uid}>"
+            rows.append((box, mention))
 
-        msg = "Starter vault claims ({} total):\n{}".format(len(rows), "\n".join(rows[:40]))
-        if len(rows) > 40:
-            msg += f"\n...and {len(rows) - 40} more."
+        lines = [f"{mention} — Vault #{box}" for box, mention in rows]
+        msg = "Starter vault claims (" + str(len(lines)) + " total):\n" + "\n".join(f"{i+1}. {line}" for i, line in enumerate(lines))
         await interaction.response.send_message(msg, ephemeral=True)
 
     @discord.ui.button(label="Pool Count", style=discord.ButtonStyle.secondary, custom_id="starteradmin_poolcount")
@@ -2239,38 +2244,30 @@ class StarterVaultAdminView(discord.ui.View):
             ephemeral=True,
         )
 
-async def ensure_starter_admin_panel():
-    """Ensures the staff-only starter vault admin panel exists."""
-    global _STARTER_ADMIN_MESSAGE_ID_RUNTIME
-
-    if not _is_digit_id(STARTER_ADMIN_CHANNEL_ID):
-        return
-
-    ch_id = int(STARTER_ADMIN_CHANNEL_ID)
-    channel = bot.get_channel(ch_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(ch_id)
-        except Exception:
-            return
+async def ensure_starter_admin_panel(guild: discord.Guild):
+    """Ensures the Starter Vault Admin panel exists (and updates it) in the configured admin channel."""
+    channel_id_str = os.getenv("STARTER_ADMIN_CHANNEL_ID", "").strip()
+    if not channel_id_str or not channel_id_str.isdigit():
+        return None
 
     embed = discord.Embed(
         title="Democracy Bot — Starter Vault Admin",
         description=_render_starter_admin_box(),
-        color=discord.Color.orange(),
+        color=0x2C2F33,
     )
-    embed.set_footer(text="Tip: Keep this panel in an Owners/Admin-only channel.")
 
     view = StarterVaultAdminView()
-
-    # Reuse the same helper we use for other panels
-    await _ensure_panel_message(
-        channel_id_str=STARTER_ADMIN_CHANNEL_ID,
-        runtime_msg_var_name="_STARTER_ADMIN_MESSAGE_ID_RUNTIME",
+    msg = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=channel_id_str,
+        message_id_runtime_name="_STARTER_ADMIN_MESSAGE_ID_RUNTIME",
         embed=embed,
         view=view,
-        env_var_name="STARTER_ADMIN_MESSAGE_ID",
+        pin=False,
+        expected_embed_title="Democracy Bot — Starter Vault Admin",
     )
+    return msg
+
 
 async def ensure_poll_panel(guild: discord.Guild) -> None:
     global _POLL_PANEL_MESSAGE_ID_RUNTIME
@@ -2529,7 +2526,8 @@ async def on_ready():
             await ensure_server_control_panel(g)
             # ✅ NEW: ensure Starter Kit + Poll panels exist (no-command modules)
             await ensure_starter_panel(g)
-            await ensure_poll_panel(g)
+        await ensure_starter_admin_panel(g)
+        await ensure_poll_panel(g)
     except Exception:
         print("MODULES: ensure panels failed:", traceback.format_exc(), flush=True)
 
