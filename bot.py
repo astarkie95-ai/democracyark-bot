@@ -987,30 +987,65 @@ async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
                 return d.get(k)
         return None
 
-    def _deep_find_gameserver(obj: Any) -> Dict[str, Any]:
-        # Try to locate a dict that looks like the gameserver payload
+    def _iter_dicts(obj: Any):
+        """Yield all dicts inside obj (depth-first)."""
         if isinstance(obj, dict):
-            # Common nesting patterns
-            for key in ("gameserver", "game_server", "gameservers", "gameServers"):
-                if key in obj:
-                    sub = obj.get(key)
-                    found = _deep_find_gameserver(sub)
-                    if found:
-                        return found
-            # Heuristic: has status and/or query and/or ip/port
-            if any(k in obj for k in ("status", "query", "ip", "port", "hostname", "map", "game")):
-                return obj
-            # Recurse into values
+            yield obj
             for v in obj.values():
-                found = _deep_find_gameserver(v)
-                if found:
-                    return found
+                yield from _iter_dicts(v)
         elif isinstance(obj, list):
             for item in obj:
-                found = _deep_find_gameserver(item)
-                if found:
-                    return found
-        return {}
+                yield from _iter_dicts(item)
+
+    def _score_gameserver(d: Dict[str, Any]) -> int:
+        score = 0
+        if not isinstance(d, dict):
+            return score
+
+        # Strong signal: a query dict that contains map/players
+        q = d.get("query")
+        if isinstance(q, dict):
+            if any(k in q for k in ("map", "map_name", "mapname", "player_current", "player_max", "players", "maxplayers")):
+                score += 6
+            score += 2  # has query at all
+
+        # Common essentials
+        if "ip" in d and "port" in d:
+            score += 4
+        if "status" in d:
+            score += 2
+
+        # Nice-to-have fields
+        for k in ("hostname", "name", "server_name", "game", "game_short", "game_name", "map", "map_name"):
+            if k in d:
+                score += 1
+
+        return score
+
+    def _deep_find_gameserver(obj: Any) -> Dict[str, Any]:
+        """Find the most 'gameserver-like' dict in a nested Nitrado response."""
+        best: Dict[str, Any] = {}
+        best_score = -1
+
+        def _walk(o: Any):
+            nonlocal best, best_score
+            if isinstance(o, dict):
+                for key in ("gameserver", "game_server", "gameservers", "gameServers", "servers"):
+                    if key in o:
+                        _walk(o.get(key))
+
+                s = _score_gameserver(o)
+                if s > best_score:
+                    best, best_score = o, s
+
+                for v in o.values():
+                    _walk(v)
+            elif isinstance(o, list):
+                for it in o:
+                    _walk(it)
+
+        _walk(obj)
+        return best if isinstance(best, dict) else {}
 
     try:
         async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as session:
@@ -1021,20 +1056,48 @@ async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
         root = data.get("data") if isinstance(data, dict) else data
         gs = _deep_find_gameserver(root) or {}
 
+        # Query info (map/players/etc) is sometimes nested inconsistently.
         query = gs.get("query") if isinstance(gs, dict) else None
         if not isinstance(query, dict):
             query = {}
 
+        # If query is still empty, try to locate a likely query dict within the gameserver payload.
+        if isinstance(gs, dict) and (not query):
+            best_q = None
+            best_q_score = -1
+            for d in _iter_dicts(gs):
+                if not isinstance(d, dict):
+                    continue
+                q_score = 0
+                if any(k in d for k in ("map", "map_name", "mapname", "level", "world")):
+                    q_score += 2
+                if any(k in d for k in ("player_current", "players_current", "player_max", "players_max", "players", "players_online", "current_players", "numplayers", "maxplayers", "slots")):
+                    q_score += 3
+                if any(k in d for k in ("ip", "port")):
+                    q_score += 1
+                if q_score > best_q_score:
+                    best_q = d
+                    best_q_score = q_score
+            if isinstance(best_q, dict) and best_q_score >= 3:
+                query = best_q
+
         status_raw = str(gs.get("status") or query.get("status") or "unknown").lower().strip()
 
         hostname = _pick(gs, ["hostname", "server_name", "name"]) or _pick(query, ["hostname", "server_name", "name"])
+        # Extra Nitrado shapes: settings.general.hostname
+        if not hostname and isinstance(gs, dict):
+            settings = gs.get("settings")
+            if isinstance(settings, dict):
+                general = settings.get("general") or settings.get("General") or settings.get("general_settings")
+                if isinstance(general, dict):
+                    hostname = _pick(general, ["hostname", "server_name", "name"])
         game = _pick(gs, ["game", "game_short", "game_name"]) or _pick(query, ["game", "game_short", "game_name"])
         map_name = _pick(gs, ["map", "map_name", "mapname", "level", "world"]) or _pick(query, ["map", "map_name", "mapname", "level", "world"])
         ip = _pick(gs, ["ip", "host", "address"]) or _pick(query, ["ip", "host", "address"])
         port = _pick(gs, ["port", "gameport", "port_game"]) or _pick(query, ["port", "gameport", "port_game", "query_port"])
 
-        players = _pick(query, ["player_current", "players", "players_online", "current_players", "numplayers", "playerCount"])
-        slots = _pick(query, ["player_max", "slots", "players_max", "maxplayers", "playerLimit", "maxPlayers"])
+        players = _pick(query, ["player_current", "players_current", "players", "players_online", "current_players", "numplayers", "playerCount", "online", "player_online"])
+        slots = _pick(query, ["player_max", "players_max", "maxplayers", "maxPlayers", "playerLimit", "slots", "capacity", "player_slots"])
 
         payload = {
             "provider": "Nitrado",
@@ -1661,7 +1724,7 @@ def _poll_panel_channel_id_for_guild(guild: discord.Guild) -> str:
 
 def _build_starter_panel_embed() -> discord.Embed:
     lines = [
-        "🎁 Claim your starter kit without commands.",
+        "🎁 Claim your free ingame starter kit",
         "",
         f"Available vaults : {len(PINS_POOL)}",
         "One per person : enabled",
