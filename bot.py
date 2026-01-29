@@ -4629,38 +4629,170 @@ class _NarcoSelect(discord.ui.Select):
         await start_tame_calculator_flow(interaction, edit=True)
 
 class _TameFlowView(discord.ui.View):
-    def __init__(self, letter_select: Optional[_CreatureLetterSelect], creature_select: Optional[_CreatureSelect], food_select: Optional[_FoodSelect], include_results: bool):
+    """Dropdown-first tame flow that stays within Discord's 5-row component layout.
+
+    Discord UI limit: 5 rows total; each Select consumes a full row.
+    We keep only the 3 essential selects (letter/creature/food) and move the
+    remaining inputs to buttons/modals to prevent the "open space" ValueError.
+    """
+
+    def __init__(
+        self,
+        letter_select: Optional[_CreatureLetterSelect],
+        creature_select: Optional[_CreatureSelect],
+        food_select: Optional[_FoodSelect],
+        include_results: bool,
+    ):
         super().__init__(timeout=600)
+
+        # Row 0/1/2: dropdowns
         if letter_select:
+            letter_select.row = 0
             self.add_item(letter_select)
         if creature_select:
+            creature_select.row = 1
             self.add_item(creature_select)
         if food_select:
+            food_select.row = 2
             self.add_item(food_select)
-        self.add_item(_LevelSelect())
-        self.add_item(_WeaponSelect())
-        self.add_item(_PctSelect())
-        self.add_item(_NarcoSelect())
 
-    @discord.ui.button(label="Calculate", style=discord.ButtonStyle.success, custom_id="calc:go")
+        # Row 3: input buttons
+        self.add_item(_SetLevelBtn())
+        self.add_item(_CycleWeaponBtn())
+        self.add_item(_SetWeaponPctBtn())
+        self.add_item(_ToggleTorporItemBtn())
+
+    @discord.ui.button(label="Calculate", style=discord.ButtonStyle.success, custom_id="calc:go", row=4)
     async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
         await run_tame_calculation(interaction)
 
-    @discord.ui.button(label="Reset", style=discord.ButtonStyle.secondary, custom_id="calc:reset")
+    @discord.ui.button(label="Reset", style=discord.ButtonStyle.secondary, custom_id="calc:reset", row=4)
     async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
         _clear_session(interaction)
         await start_tame_calculator_flow(interaction, edit=True)
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="calc:close")
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="calc:close", row=4)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         _clear_session(interaction)
         try:
             if interaction.response.is_done():
-                await interaction.followup.edit_message(message_id=interaction.message.id, content="✅ Closed.", view=None, embed=None)
+                await interaction.followup.edit_message(message_id=interaction.message.id, content="✅ Closed.", embed=None, view=None)
             else:
-                await interaction.response.edit_message(content="✅ Closed.", view=None, embed=None)
+                await interaction.response.edit_message(content="✅ Closed.", embed=None, view=None)
         except Exception:
             pass
+
+
+class _SetLevelModal(discord.ui.Modal, title="Set Wild Level"):
+    level = discord.ui.TextInput(label="Wild level (e.g. 150)", placeholder="150", required=True, max_length=5)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        st = _get_session(interaction)
+        try:
+            lv = int(str(self.level.value).strip())
+            if lv <= 0:
+                raise ValueError("level must be > 0")
+            st["level"] = lv
+        except Exception:
+            try:
+                msg = "❌ Invalid level. Use a positive number (e.g. 150)."
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+            return
+        await start_tame_calculator_flow(interaction, edit=True)
+
+
+class _SetWeaponPctModal(discord.ui.Modal, title="Set Weapon Damage %"):
+    pct = discord.ui.TextInput(label="Weapon damage % (e.g. 100)", placeholder="100", required=True, max_length=6)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        st = _get_session(interaction)
+        try:
+            p = float(str(self.pct.value).strip())
+            if p <= 0:
+                raise ValueError("pct must be > 0")
+            st["weapon_dmg"] = p
+        except Exception:
+            try:
+                msg = "❌ Invalid %. Use a positive number (e.g. 100)."
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+            return
+        await start_tame_calculator_flow(interaction, edit=True)
+
+
+class _SetLevelBtn(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Set Level", style=discord.ButtonStyle.primary, custom_id="calc:set_level", row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.send_modal(_SetLevelModal())
+        except Exception as e:
+            try:
+                msg = f"❌ Could not open level form: {e}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+
+class _SetWeaponPctBtn(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Set Weapon %", style=discord.ButtonStyle.primary, custom_id="calc:set_pct", row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.send_modal(_SetWeaponPctModal())
+        except Exception as e:
+            try:
+                msg = f"❌ Could not open % form: {e}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+
+class _CycleWeaponBtn(discord.ui.Button):
+    _WEAPONS = ["club", "slingshot", "bow_arrow", "crossbow_arrow", "tranq_dart", "shocking_tranq_dart"]
+
+    def __init__(self):
+        super().__init__(label="Weapon (cycle)", style=discord.ButtonStyle.secondary, custom_id="calc:weapon", row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        st = _get_session(interaction)
+        cur = str(st.get("weapon") or "crossbow_arrow")
+        try:
+            idx = self._WEAPONS.index(cur)
+        except ValueError:
+            idx = 0
+        nxt = self._WEAPONS[(idx + 1) % len(self._WEAPONS)]
+        st["weapon"] = nxt
+        await start_tame_calculator_flow(interaction, edit=True)
+
+
+class _ToggleTorporItemBtn(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Torpor item (toggle)", style=discord.ButtonStyle.secondary, custom_id="calc:torpor_item", row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        st = _get_session(interaction)
+        cur = str(st.get("narco") or "narcotic")
+        nxt = "bio_toxin" if cur != "bio_toxin" else "narcotic"
+        st["narco"] = nxt
+        await start_tame_calculator_flow(interaction, edit=True)
 
 async def start_tame_calculator_flow(interaction: discord.Interaction, edit: bool = False):
     ok = await _ensure_calc_data(interaction)
@@ -4749,8 +4881,16 @@ async def start_tame_calculator_flow(interaction: discord.Interaction, edit: boo
                 await interaction.followup.send(embed=embed, view=view, ephemeral=True)
             else:
                 await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            msg = f"❌ Could not render tame calculator UI: {e}"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
 
 
 async def run_tame_calculation(interaction: discord.Interaction):
@@ -4770,8 +4910,6 @@ async def run_tame_calculation(interaction: discord.Interaction):
     if not creature: missing.append("Creature")
     if not level: missing.append("Level")
     if not food: missing.append("Food")
-    if not st.get("weapon_dmg"): missing.append("Weapon %")
-    if not st.get("narco"): missing.append("Torpor item")
     if missing:
         msg = "❌ Missing: " + ", ".join(missing)
         if interaction.response.is_done():
@@ -4833,9 +4971,22 @@ async def run_tame_calculation(interaction: discord.Interaction):
             inline=False,
         )
 
-        await interaction.followup.send(embed=e, ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=e, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=e, ephemeral=True)
+        except Exception:
+            pass
     except Exception as ex:
-        await interaction.followup.send(f"⚠️ Calculation failed: {ex}", ephemeral=True)
+        try:
+            msg = f"⚠️ Calculation failed: {ex}"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 # Breeding flow (dropdown-first; creature selection reused)
 class _BreedingFlowView(discord.ui.View):
@@ -4867,7 +5018,7 @@ async def start_breeding_calculator_flow(interaction: discord.Interaction, edit:
 
     st = _get_session(interaction)
 
-    creature_keys = sorted(list(_BREEDING_TABLES.keys()), key=lambda x: x.lower()) if _BREEDING_TABLES else []
+    creature_keys = sorted([v.get('name') for v in (_BREEDING_DATA or {}).values() if isinstance(v, dict) and v.get('name')], key=lambda x: x.lower()) if _BREEDING_DATA else []
     groups = _creature_letter_groups(creature_keys)
     letters = list(groups.keys())
 
