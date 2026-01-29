@@ -3478,14 +3478,17 @@ async def paneldiagnose(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         return
 
+    # ✅ Defer immediately so Discord doesn't time out while we run checks
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     guild = interaction.guild
     if guild is None:
-        await interaction.response.send_message("❌ Run this inside the server.", ephemeral=True)
+        await interaction.followup.send("❌ Run this inside the server.", ephemeral=True)
         return
 
     me = guild.me or guild.get_member(getattr(bot.user, "id", 0))
     if me is None:
-        await interaction.response.send_message("❌ Couldn't resolve the bot member in this guild.", ephemeral=True)
+        await interaction.followup.send("❌ Couldn't resolve the bot member in this guild.", ephemeral=True)
         return
 
     checks = [
@@ -3553,13 +3556,16 @@ async def paneldiagnose(interaction: discord.Interaction):
     # Discord limit
     if len(out) > 1900:
         out = out[:1900] + "\n…(truncated)"
-    await interaction.response.send_message(out, ephemeral=True)
+    await interaction.followup.send(out, ephemeral=True)
 
 @bot.tree.command(name="showpanelids", description="Show the current runtime panel message IDs (copy to Railway variables).")
 async def showpanelids(interaction: discord.Interaction):
     if not _is_staff_member(interaction.user):
         await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         return
+
+    # ✅ Defer so we can always reply even if Discord is slow
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     lines = [
         "**Runtime Panel Message IDs** (copy these into Railway if needed)",
@@ -3572,7 +3578,7 @@ async def showpanelids(interaction: discord.Interaction):
         f"SELF_ROLES_MESSAGE_ID: `{globals().get('_SELF_ROLES_MESSAGE_ID_RUNTIME', 0) or 0}`",
         f"ROLE_MANAGER_MESSAGE_ID: `{globals().get('_ROLE_MANAGER_MESSAGE_ID_RUNTIME', 0) or 0}`",
     ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 # -----------------------
 # ✅ Owners-only: restart Nitrado server
