@@ -99,6 +99,24 @@ POLL_PANEL_MESSAGE_ID = os.getenv("POLL_PANEL_MESSAGE_ID", "").strip()
 POLL_PANEL_PIN = os.getenv("POLL_PANEL_PIN", "1").strip().lower() in ("1","true","yes","on")
 
 
+
+
+# ✅ NEW: Role panels (Visitor -> Survivor + optional self-assign roles)
+# - GET_ROLE_CHANNEL_ID: channel where the public role panel lives (e.g. #get-role)
+# - GET_ROLE_MESSAGE_ID: message id to keep editing (optional)
+# - SURVIVOR_ROLE_ID: role id for "Survivor"
+# - ROLE_MANAGER_CHANNEL_ID: staff channel for role manager module (optional; default SERVER_CONTROL_CHANNEL_ID)
+# - ROLE_MANAGER_MESSAGE_ID: message id to keep editing (optional)
+# - SELF_ROLES_CSV_PATH: CSV fallback for self-assign roles list (if DB is unavailable)
+GET_ROLE_CHANNEL_ID = os.getenv("GET_ROLE_CHANNEL_ID", "").strip()
+GET_ROLE_MESSAGE_ID = os.getenv("GET_ROLE_MESSAGE_ID", "").strip()
+SURVIVOR_ROLE_ID = os.getenv("SURVIVOR_ROLE_ID", "").strip()
+
+ROLE_MANAGER_CHANNEL_ID = os.getenv("ROLE_MANAGER_CHANNEL_ID", "").strip()
+ROLE_MANAGER_MESSAGE_ID = os.getenv("ROLE_MANAGER_MESSAGE_ID", "").strip()
+ROLE_MANAGER_PIN = os.getenv("ROLE_MANAGER_PIN", "0").strip().lower() in ("1","true","yes","on")
+
+SELF_ROLES_CSV_PATH = os.getenv("SELF_ROLES_CSV_PATH", "self_roles.csv").strip()
 # ✅ NEW: Poll module channels split (optional)
 # - POLL_CREATE_CHANNEL_ID: where the Poll PANEL lives (private staff channel, e.g. #create-poll)
 # - POLL_VOTE_CHANNEL_ID  : where polls are posted for players to vote (public, e.g. #vote)
@@ -203,6 +221,9 @@ class DemocracyBot(commands.Bot):
             self.add_view(StarterKitPanelView())
             self.add_view(StarterVaultAdminView())
             self.add_view(PersistentPollPanelView())
+            self.add_view(GetRoleView())
+            self.add_view(SelfRolesView())
+            self.add_view(RoleManagerView())
             print("TICKETS: persistent views registered", flush=True)
         except Exception:
             print("TICKETS: failed to register views:", traceback.format_exc(), flush=True)
@@ -416,6 +437,16 @@ async def db_init() -> None:
                     PRIMARY KEY (message_id, user_id)
                 );
             """)
+
+            # ✅ NEW: Self-assign roles list (role manager / get-role panel)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS self_roles (
+                    role_id BIGINT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    added_at BIGINT NOT NULL
+                );
+            """)
             print("✅ DB: tables ensured.", flush=True)
             print("✅ DB: ticket tables ensured.", flush=True)
 
@@ -600,6 +631,45 @@ async def db_record_poll_vote(message_id: int, user_id: int, option_index: int) 
         )
 
 
+
+# -----------------------
+# ✅ NEW: Self roles DB helpers
+# -----------------------
+async def db_load_self_roles() -> Dict[int, Tuple[str, str]]:
+    if DB_POOL is None:
+        return {}
+    out: Dict[int, Tuple[str, str]] = {}
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT role_id, label, description FROM self_roles ORDER BY added_at ASC;")
+        for r in rows:
+            try:
+                rid = int(r["role_id"])
+                label = str(r["label"] or "").strip() or f"Role {rid}"
+                desc = str(r["description"] or "").strip()
+                out[rid] = (label, desc)
+            except Exception:
+                continue
+    return out
+
+async def db_upsert_self_role(role_id: int, label: str, description: str = "") -> None:
+    if DB_POOL is None:
+        return
+    await _db_execute(
+        """
+        INSERT INTO self_roles (role_id, label, description, added_at)
+        VALUES ($1,$2,$3,$4)
+        ON CONFLICT (role_id) DO UPDATE SET
+          label=EXCLUDED.label,
+          description=EXCLUDED.description;
+        """,
+        int(role_id), str(label or ""), str(description or ""), int(time.time())
+    )
+
+async def db_delete_self_role(role_id: int) -> None:
+    if DB_POOL is None:
+        return
+    await _db_execute("DELETE FROM self_roles WHERE role_id=$1;", int(role_id))
+
 # -----------------------
 # Data models
 # -----------------------
@@ -613,6 +683,9 @@ PINS_POOL: Dict[int, BoxPin] = {}
 # In-memory claims: user_id -> (box, pin)
 CLAIMS: Dict[int, Tuple[int, str]] = {}
 CLAIMED_USERS: Set[int] = set()  # user_ids who have EVER claimed (even if a vault is later recycled)
+
+# Self-assign roles (role_id -> (label, description))
+SELF_ROLES: Dict[int, Tuple[str, str]] = {}
 
 # -----------------------
 # Helpers: permissions
@@ -2584,6 +2657,389 @@ async def refresh_poll_panel(guild: discord.Guild, vote_channel_id: int) -> None
     except Exception:
         pass
 
+
+
+# =====================================================================
+# ✅ NEW: Get-Role Panel (Visitor -> Survivor) + Role Manager (staff)
+# =====================================================================
+
+_GET_ROLE_MESSAGE_ID_RUNTIME: int = int(GET_ROLE_MESSAGE_ID) if _is_digit_id(GET_ROLE_MESSAGE_ID) else 0
+_ROLE_MANAGER_MESSAGE_ID_RUNTIME: int = int(ROLE_MANAGER_MESSAGE_ID) if _is_digit_id(ROLE_MANAGER_MESSAGE_ID) else 0
+
+def _role_manager_channel_id() -> str:
+    # Default to the existing server control panel channel if not specified
+    if _is_digit_id(ROLE_MANAGER_CHANNEL_ID):
+        return ROLE_MANAGER_CHANNEL_ID
+    return SERVER_CONTROL_CHANNEL_ID
+
+def _build_get_role_embed(guild: discord.Guild) -> discord.Embed:
+    survivor = "<not set>"
+    if _is_digit_id(SURVIVOR_ROLE_ID):
+        r = guild.get_role(int(SURVIVOR_ROLE_ID))
+        survivor = r.name if r else f"{SURVIVOR_ROLE_ID}"
+    lines = [
+        "🧭 New here? You're a **Visitor** until you've created your character in-game.",
+        "",
+        "✅ Once you've spawned in and you're established, press the button below to unlock:",
+        f"• **{survivor}**",
+        "",
+        "If you need help first, open a ticket in **#open-a-ticket**.",
+    ]
+    e = discord.Embed(
+        title="🧬 Democracy Bot — Get Roles",
+        description=_module_box("GET ROLE", lines),
+        color=0x9B59B6,
+    )
+    e.set_footer(text="If the button fails, ensure the bot role is above the Survivor role and has Manage Roles.")
+    e.timestamp = datetime.utcnow()
+    return e
+
+def _build_role_manager_embed(guild: discord.Guild) -> discord.Embed:
+    count = len(SELF_ROLES)
+    lines = [
+        "🔧 Manage which roles the bot can hand out (self-assign roles list).",
+        "",
+        f"Self-assign roles configured : {count}",
+        "",
+        "Buttons:",
+        "• Add Role — add an existing Discord role to the self-assign list",
+        "• Remove Role — remove from list",
+        "• List Roles — view configured roles",
+    ]
+    e = discord.Embed(
+        title="🧩 Democracy Bot — Role Manager (Staff)",
+        description=_module_box("ROLE MANAGER", lines),
+        color=0x1ABC9C,
+    )
+    e.timestamp = datetime.utcnow()
+    return e
+
+def _parse_role_id(raw: str) -> Optional[int]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^<@&(\d+)>$", s)
+    if m:
+        return int(m.group(1))
+    if s.isdigit():
+        return int(s)
+    return None
+
+class GetRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ Server context required.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    @discord.ui.button(label="I’m established in-game (Get Survivor)", style=discord.ButtonStyle.success, custom_id="getrole_survivor_toggle")
+    async def survivor_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+        if not _is_digit_id(SURVIVOR_ROLE_ID):
+            return await interaction.response.send_message("❌ SURVIVOR_ROLE_ID is not set in Railway.", ephemeral=True)
+
+        role = interaction.guild.get_role(int(SURVIVOR_ROLE_ID))
+        if not role:
+            return await interaction.response.send_message("❌ Survivor role not found in this server.", ephemeral=True)
+
+        try:
+            if role in interaction.user.roles:
+                await interaction.user.remove_roles(role, reason="Democracy Bot: self-toggle Survivor")
+                await interaction.response.send_message(f"✅ Removed **{role.name}**.", ephemeral=True)
+            else:
+                await interaction.user.add_roles(role, reason="Democracy Bot: self-toggle Survivor")
+                await interaction.response.send_message(f"✅ You now have **{role.name}**. Welcome!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I can't manage that role. Ensure my bot role is ABOVE the Survivor role and I have **Manage Roles**.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed: {type(e).__name__}: {e}", ephemeral=True)
+
+class _RoleAddModal(discord.ui.Modal, title="Add self-assign role"):
+    role_id_or_mention = discord.ui.TextInput(
+        label="Role ID or @Role mention",
+        required=True,
+        max_length=64,
+        placeholder="1234567890 or <@&1234567890>",
+    )
+    label = discord.ui.TextInput(
+        label="Button label (optional)",
+        required=False,
+        max_length=60,
+        placeholder="e.g. Builder",
+    )
+    description = discord.ui.TextInput(
+        label="Description (optional)",
+        required=False,
+        max_length=120,
+        placeholder="e.g. For community builders",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+        if not is_staff_member(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+
+        rid = _parse_role_id(str(self.role_id_or_mention.value or ""))
+        if not rid:
+            return await interaction.response.send_message("❌ Invalid role ID/mention.", ephemeral=True)
+
+        role = interaction.guild.get_role(int(rid))
+        if not role:
+            return await interaction.response.send_message("❌ That role doesn't exist in this server.", ephemeral=True)
+
+        if _is_digit_id(SURVIVOR_ROLE_ID) and int(rid) == int(SURVIVOR_ROLE_ID):
+            return await interaction.response.send_message("ℹ️ Survivor is managed by the Get-Role panel, not the self-role list.", ephemeral=True)
+
+        lab = str(self.label.value or "").strip() or role.name
+        desc = str(self.description.value or "").strip()
+
+        global SELF_ROLES
+        SELF_ROLES[int(rid)] = (lab, desc)
+
+        if DB_POOL is not None:
+            try:
+                await db_upsert_self_role(int(rid), lab, desc)
+            except Exception:
+                pass
+        else:
+            await save_self_roles_only()
+
+        try:
+            await ensure_role_manager_panel(interaction.guild)
+            await ensure_self_roles_panel(interaction.guild)
+        except Exception:
+            pass
+
+        await interaction.response.send_message(f"✅ Added **{role.name}** to self-assign roles.", ephemeral=True)
+
+class _RoleRemoveModal(discord.ui.Modal, title="Remove self-assign role"):
+    role_id_or_mention = discord.ui.TextInput(
+        label="Role ID or @Role mention",
+        required=True,
+        max_length=64,
+        placeholder="1234567890 or <@&1234567890>",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+        if not is_staff_member(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+
+        rid = _parse_role_id(str(self.role_id_or_mention.value or ""))
+        if not rid:
+            return await interaction.response.send_message("❌ Invalid role ID/mention.", ephemeral=True)
+
+        global SELF_ROLES
+        if int(rid) not in SELF_ROLES:
+            return await interaction.response.send_message("ℹ️ That role is not in the self-assign list.", ephemeral=True)
+
+        SELF_ROLES.pop(int(rid), None)
+
+        if DB_POOL is not None:
+            try:
+                await db_delete_self_role(int(rid))
+            except Exception:
+                pass
+        else:
+            await save_self_roles_only()
+
+        try:
+            await ensure_role_manager_panel(interaction.guild)
+            await ensure_self_roles_panel(interaction.guild)
+        except Exception:
+            pass
+
+        await interaction.response.send_message("✅ Removed from self-assign list.", ephemeral=True)
+
+class SelfRolesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        items = list(SELF_ROLES.items())[:20]
+        for rid, (label, _desc) in items:
+            self.add_item(_SelfRoleButton(role_id=int(rid), label=label))
+
+class _SelfRoleButton(discord.ui.Button):
+    def __init__(self, role_id: int, label: str):
+        super().__init__(
+            label=(label[:80] if label else f"Role {role_id}"),
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"selfrole_toggle_{role_id}",
+        )
+        self.role_id = int(role_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+        role = interaction.guild.get_role(self.role_id)
+        if not role:
+            return await interaction.response.send_message("❌ Role no longer exists.", ephemeral=True)
+
+        try:
+            if role in interaction.user.roles:
+                await interaction.user.remove_roles(role, reason="Democracy Bot: self-role toggle")
+                await interaction.response.send_message(f"✅ Removed **{role.name}**.", ephemeral=True)
+            else:
+                await interaction.user.add_roles(role, reason="Democracy Bot: self-role toggle")
+                await interaction.response.send_message(f"✅ Added **{role.name}**.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I can't manage that role. Ensure my bot role is ABOVE the target role and I have **Manage Roles**.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed: {type(e).__name__}: {e}", ephemeral=True)
+
+def _build_self_roles_embed() -> discord.Embed:
+    if not SELF_ROLES:
+        lines = [
+            "No self-assign roles have been configured yet.",
+            "",
+            "Staff can add roles using the Role Manager module.",
+        ]
+    else:
+        lines = ["Press a button to toggle a role:", ""]
+        for rid, (label, desc) in list(SELF_ROLES.items())[:20]:
+            d = f" — {desc}" if desc else ""
+            lines.append(f"• {label}{d}")
+        if len(SELF_ROLES) > 20:
+            lines.append("…and more (limit 20 buttons per panel).")
+    e = discord.Embed(
+        title="🏷️ Democracy Bot — Self Roles",
+        description=_module_box("SELF ROLES", lines),
+        color=0x95A5A6,
+    )
+    e.timestamp = datetime.utcnow()
+    return e
+
+async def ensure_get_role_panel(guild: discord.Guild) -> None:
+    global _GET_ROLE_MESSAGE_ID_RUNTIME
+    if not _is_digit_id(GET_ROLE_CHANNEL_ID):
+        return
+
+    msg_id = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=GET_ROLE_CHANNEL_ID,
+        message_id_runtime_name="_GET_ROLE_MESSAGE_ID_RUNTIME",
+        embed=_build_get_role_embed(guild),
+        view=GetRoleView(),
+        pin=False,
+        expected_embed_title="🧬 Democracy Bot — Get Roles",
+    )
+    if msg_id and msg_id != _GET_ROLE_MESSAGE_ID_RUNTIME:
+        _GET_ROLE_MESSAGE_ID_RUNTIME = msg_id
+        print(f"[GET-ROLE] New GET_ROLE_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
+
+async def ensure_self_roles_panel(guild: discord.Guild) -> None:
+    if not _is_digit_id(GET_ROLE_CHANNEL_ID):
+        return
+    await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=GET_ROLE_CHANNEL_ID,
+        message_id_runtime_name="__unused_self_roles_msg_id_runtime",
+        embed=_build_self_roles_embed(),
+        view=SelfRolesView(),
+        pin=False,
+        expected_embed_title="🏷️ Democracy Bot — Self Roles",
+    )
+
+class RoleManagerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ Server context required.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        if not is_staff_member(interaction.user):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("🔒 Staff only.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    @discord.ui.button(label="Add Role", style=discord.ButtonStyle.success, custom_id="roleman_add")
+    async def add_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_modal(_RoleAddModal())
+
+    @discord.ui.button(label="Remove Role", style=discord.ButtonStyle.danger, custom_id="roleman_remove")
+    async def remove_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_modal(_RoleRemoveModal())
+
+    @discord.ui.button(label="List Roles", style=discord.ButtonStyle.secondary, custom_id="roleman_list")
+    async def list_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.guild:
+            return
+        if not SELF_ROLES:
+            return await interaction.response.send_message("No self-assign roles configured.", ephemeral=True)
+
+        lines = []
+        for rid, (label, desc) in SELF_ROLES.items():
+            role = interaction.guild.get_role(int(rid))
+            name = role.name if role else f"<missing:{rid}>"
+            extra = f" — {desc}" if desc else ""
+            lines.append(f"• {name} (`{rid}`) — label: {label}{extra}")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    @discord.ui.button(label="Refresh Panels", style=discord.ButtonStyle.primary, custom_id="roleman_refresh")
+    async def refresh_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not interaction.guild:
+            return
+        try:
+            await ensure_role_manager_panel(interaction.guild)
+            await ensure_get_role_panel(interaction.guild)
+            await ensure_self_roles_panel(interaction.guild)
+        except Exception:
+            pass
+        await interaction.response.send_message("✅ Refreshed role panels.", ephemeral=True)
+
+async def ensure_role_manager_panel(guild: discord.Guild) -> None:
+    global _ROLE_MANAGER_MESSAGE_ID_RUNTIME
+
+    ch_id = _role_manager_channel_id()
+    if not _is_digit_id(ch_id):
+        return
+
+    msg_id = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=ch_id,
+        message_id_runtime_name="_ROLE_MANAGER_MESSAGE_ID_RUNTIME",
+        embed=_build_role_manager_embed(guild),
+        view=RoleManagerView(),
+        pin=ROLE_MANAGER_PIN,
+        expected_embed_title="🧩 Democracy Bot — Role Manager (Staff)",
+    )
+    if msg_id and msg_id != _ROLE_MANAGER_MESSAGE_ID_RUNTIME:
+        _ROLE_MANAGER_MESSAGE_ID_RUNTIME = msg_id
+        print(f"[ROLEMAN] New ROLE_MANAGER_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
 # -----------------------
 # ✅ NEW: Helpers — enforce specific channels for commands
 # -----------------------
@@ -2737,6 +3193,39 @@ def save_claimed_users_state(users: Set[int]) -> None:
     except Exception:
         pass
 
+
+
+# -----------------------
+# ✅ NEW: Self-assign roles (CSV fallback)
+# -----------------------
+def load_self_roles_state() -> Dict[int, Tuple[str, str]]:
+    ensure_file_exists(SELF_ROLES_CSV_PATH, ["role_id", "label", "description", "added_at"])
+    out: Dict[int, Tuple[str, str]] = {}
+    try:
+        with open(SELF_ROLES_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            for row in rdr:
+                try:
+                    rid = int(str(row.get("role_id") or "").strip() or "0")
+                    if not rid:
+                        continue
+                    label = str(row.get("label") or "").strip() or f"Role {rid}"
+                    desc = str(row.get("description") or "").strip()
+                    out[rid] = (label, desc)
+                except Exception:
+                    continue
+    except Exception:
+        return {}
+    return out
+
+def save_self_roles_state(roles: Dict[int, Tuple[str, str]]) -> None:
+    ensure_file_exists(SELF_ROLES_CSV_PATH, ["role_id", "label", "description", "added_at"])
+    now_ts = int(time.time())
+    with open(SELF_ROLES_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["role_id", "label", "description", "added_at"])
+        for rid, (label, desc) in sorted(roles.items(), key=lambda x: x[0]):
+            w.writerow([int(rid), str(label or ""), str(desc or ""), now_ts])
     now_ts = int(time.time())
     with open(CLAIMED_USERS_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["user_id", "first_claimed_at", "last_box", "last_pin"])
@@ -2764,8 +3253,9 @@ def pool_counts() -> str:
 # -----------------------
 # ✅ NEW: persistence wrappers (DB preferred, CSV fallback)
 # -----------------------
+
 async def load_state() -> None:
-    global PINS_POOL, CLAIMS, CLAIMED_USERS
+    global PINS_POOL, CLAIMS, CLAIMED_USERS, SELF_ROLES
     if DB_POOL is not None:
         PINS_POOL = await db_load_pins_pool()
         CLAIMS = await db_load_claims_state()
@@ -2775,7 +3265,8 @@ async def load_state() -> None:
                 CLAIMED_USERS = await db_load_claimed_users(con)
         except Exception as e:
             print(f"STATE: failed to load CLAIMED_USERS from DB: {e}")
-        # ✅ NEW: preload active polls so votes and results survive restarts
+
+        # ✅ preload active polls so votes and results survive restarts
         try:
             polls = await db_load_active_polls()
             for p in polls:
@@ -2795,12 +3286,20 @@ async def load_state() -> None:
                     continue
         except Exception:
             pass
+
+        # ✅ load self-assign roles list
+        try:
+            SELF_ROLES = await db_load_self_roles()
+        except Exception:
+            SELF_ROLES = {}
+
         return
 
     # Fallback to CSV
     PINS_POOL = load_pins_pool()
     CLAIMS = load_claims_state()
     CLAIMED_USERS = load_claimed_users_state()
+    SELF_ROLES = load_self_roles_state()
 
 async def save_pool_state() -> None:
     if DB_POOL is not None:
@@ -2825,6 +3324,15 @@ async def save_claimed_users_only() -> None:
         return
     save_claimed_users_state(CLAIMED_USERS)
 
+
+
+async def save_self_roles_only() -> None:
+    """Persist SELF_ROLES list (DB preferred, CSV fallback)."""
+    global SELF_ROLES
+    if DB_POOL is not None:
+        # DB writes are done per add/remove via db_upsert_self_role / db_delete_self_role
+        return
+    save_self_roles_state(SELF_ROLES)
 async def log_reset(admin_id: int, box: int, user_id: int, pin: str, reason: str = "") -> None:
     if DB_POOL is not None:
         await db_append_reset_log(admin_id, box, user_id, pin, reason)
@@ -2869,6 +3377,9 @@ async def on_ready():
             bot.add_view(StarterVaultAdminView())
             bot.add_view(TicketPanelView())
             bot.add_view(TicketControlsView())
+            bot.add_view(GetRoleView())
+            bot.add_view(SelfRolesView())
+            bot.add_view(RoleManagerView())
             VIEWS_REGISTERED = True
             print("UI: persistent views registered", flush=True)
         except Exception:
@@ -2888,6 +3399,9 @@ async def on_ready():
             await ensure_starter_panel(g)
             await ensure_starter_admin_panel(g)
             await ensure_poll_panel(g)
+            await ensure_get_role_panel(g)
+            await ensure_self_roles_panel(g)
+            await ensure_role_manager_panel(g)
     except Exception:
         print("MODULES: ensure panels failed:", traceback.format_exc(), flush=True)
 
