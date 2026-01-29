@@ -4179,79 +4179,143 @@ class _BreedingHTMLParser(HTMLParser):
         if self.in_td:
             self.buf.append(data)
 
+
+def _calc_norm_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (name or "").strip().lower())
+
+def _extract_seconds_from_raw_value(key: str, val: Any) -> Optional[int]:
+    """Best-effort conversion of ARKStatsExtractor breeding values into seconds."""
+    if val is None:
+        return None
+    # Strings like "1d 02:30" or "18:00"
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        sec = _parse_time_to_seconds(s)
+        if sec is not None:
+            return sec
+        # numeric string
+        try:
+            f = float(s)
+            val = f
+        except Exception:
+            return None
+
+    if isinstance(val, (int, float)):
+        v = float(val)
+        k = (key or "").lower()
+        # Heuristic units
+        if "minute" in k or k.endswith("min"):
+            return int(round(v * 60))
+        if "hour" in k:
+            return int(round(v * 3600))
+        if "day" in k:
+            return int(round(v * 86400))
+        # Otherwise assume seconds (ARKStatsExtractor uses seconds for most values)
+        return int(round(v))
+    return None
+
+def _build_breeding_map_from_raw(raw: Any) -> Dict[str, Any]:
+    """Traverse a raw ARKStatsExtractor values.json structure and build a map:
+       normalized_species -> {incubation_seconds, gestation_seconds, maturation_seconds,
+                              imprint_period_seconds, mating_interval_min_seconds, mating_interval_max_seconds}
+    """
+    target_keys = {
+        "incubationtime", "eggincubationtime", "gestationtime",
+        "maturationtime", "maturetime", "maturation",
+        "imprintperiod", "imprintperiodseconds",
+        "matingintervalmin", "matingintervalmax", "matingintervalmins", "matingintervalmaxs",
+    }
+
+    out: Dict[str, Any] = {}
+
+    def walk(node: Any, path_key: Optional[str] = None):
+        if isinstance(node, dict):
+            # Determine if this dict looks like a creature record
+            lowered = {str(k).lower(): k for k in node.keys()}
+            hit = any(k in target_keys for k in lowered.keys())
+            if hit and path_key:
+                rec: Dict[str, Any] = {}
+                for lk, origk in lowered.items():
+                    if lk in ("incubationtime", "eggincubationtime"):
+                        rec["incubation_seconds"] = _extract_seconds_from_raw_value(lk, node[origk])
+                    elif lk == "gestationtime":
+                        rec["gestation_seconds"] = _extract_seconds_from_raw_value(lk, node[origk])
+                    elif lk in ("maturationtime", "maturetime", "maturation"):
+                        rec["maturation_seconds"] = _extract_seconds_from_raw_value(lk, node[origk])
+                    elif lk in ("imprintperiod", "imprintperiodseconds"):
+                        rec["imprint_period_seconds"] = _extract_seconds_from_raw_value(lk, node[origk])
+                    elif lk in ("matingintervalmin", "matingintervalmins"):
+                        rec["mating_interval_min_seconds"] = _extract_seconds_from_raw_value(lk, node[origk])
+                    elif lk in ("matingintervalmax", "matingintervalmaxs"):
+                        rec["mating_interval_max_seconds"] = _extract_seconds_from_raw_value(lk, node[origk])
+
+                # Only store if it has something useful
+                if any(rec.get(k) is not None for k in rec.keys()):
+                    out[_calc_norm_name(path_key)] = rec
+
+            for k, v in node.items():
+                walk(v, str(k))
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, path_key)
+
+    walk(raw, None)
+    return out
+
+
+
 async def ensure_breeding_data_loaded(force: bool = False) -> bool:
+    """Load breeding data ONLY from local JSON files.
+    Priority:
+      1) ./data/breeding.json (curated/mapped)
+      2) ./data/breeding_values_raw.json (ARKStatsExtractor raw; best-effort mapping in-memory)
+    """
     global _BREEDING_DATA, _BREEDING_LOADED_AT
+
     if not force and _BREEDING_DATA and (time.time() - _BREEDING_LOADED_AT) < 7 * 24 * 3600:
         return True
+
     async with _BREEDING_LOCK:
         if not force and _BREEDING_DATA and (time.time() - _BREEDING_LOADED_AT) < 7 * 24 * 3600:
             return True
+
+        base_dir = os.path.dirname(__file__)
+        data_dir = os.path.join(base_dir, "data")
+        breeding_path = os.path.join(data_dir, "breeding.json")
+        raw_path = os.path.join(data_dir, "breeding_values_raw.json")
+
+        # 1) Prefer curated breeding.json if populated
         try:
-            html = await _fetch_text(_BREEDING_TABLE_URL)
-            p = _BreedingHTMLParser()
-            p.feed(html)
-
-            data: Dict[str, Any] = {}
-            for r in p.rows:
-                # Expected structure from fandom Table_of_Breeding:
-                # [Species, ... , Incubation Time, Baby, Juvenile, Adolescent, Total, Mating Interval]
-                # But the exact column count varies (temperature columns, images, etc.)
-                # We'll find times by scanning for recognizable patterns.
-                species = (r[0] or "").strip()
-                if not species or species.lower() in ("species", "visual"):
-                    continue
-
-                # Find a "total" maturation cell (has 'd' or ':'), typically one of the last few columns before mating interval.
-                # We'll use the last time-like cell as total, and last range-like as mating interval.
-                time_cells = [c for c in r if re.search(r"(\d+\s*d\s*\d{1,2}:\d{2}|\d{1,3}:\d{2}|\d+\s*[dhms])", c.lower())]
-                if not time_cells:
-                    continue
-
-                # Mating interval range usually contains '-' or '–'
-                mating_cell = None
-                for c in reversed(r):
-                    if "–" in c or "-" in c:
-                        # avoid temperatures like '26 32' (no ':')
-                        if re.search(r"\d", c) and (":" in c or "h" in c.lower() or "d" in c.lower()):
-                            mating_cell = c
-                            break
-
-                # Incubation/hatch time is often a small hh:mm near the first half of the time columns
-                incubation = None
-                total = None
-
-                # Heuristic: "Total" often appears just before mating interval and is the longest duration-like cell.
-                parsed_times = []
-                for c in time_cells:
-                    v = _parse_time_to_seconds(c)
-                    if v is not None:
-                        parsed_times.append((v, c))
-                if parsed_times:
-                    total = max(parsed_times, key=lambda x: x[0])[0]
-                    # Incubation tends to be one of the smallest non-zero times
-                    incubation = min(parsed_times, key=lambda x: x[0])[0]
-
-                mating_min, mating_max = _parse_range_to_seconds(mating_cell) if mating_cell else (None, None)
-
-                data[_normalize_name(species)] = {
-                    "name": species,
-                    "incubation_s": incubation,
-                    "maturation_s": total,
-                    "mating_min_s": mating_min,
-                    "mating_max_s": mating_max,
-                }
-
-            if not data:
-                raise RuntimeError("no rows parsed")
-
-            _BREEDING_DATA = data
-            _BREEDING_LOADED_AT = int(time.time())
-            print(f"✅ BREED: loaded {len(data)} breeding rows from Table_of_Breeding.", flush=True)
-            return True
+            if os.path.exists(breeding_path):
+                with open(breeding_path, "r", encoding="utf-8") as f:
+                    b = json.load(f)
+                if isinstance(b, dict) and len(b) > 0:
+                    _BREEDING_DATA = b
+                    _BREEDING_LOADED_AT = int(time.time())
+                    return True
         except Exception:
-            print("⚠️ BREED: failed to load breeding data.\n" + traceback.format_exc(), flush=True)
-            _BREEDING_DATA = None
-            return False
+            pass
+
+        # 2) Fallback: map ARKStatsExtractor raw values into a usable dict
+        try:
+            if os.path.exists(raw_path):
+                with open(raw_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                mapped = _build_breeding_map_from_raw(raw)
+                if mapped:
+                    _BREEDING_DATA = mapped
+                    _BREEDING_LOADED_AT = int(time.time())
+                    return True
+        except Exception as e:
+            print(f"Breeding raw parse failed: {e}", file=sys.stderr)
+
+        # No local breeding data available
+        _BREEDING_DATA = {}
+        _BREEDING_LOADED_AT = int(time.time())
+        return False
+
 
 def _resolve_breeding_key(name: str) -> Optional[str]:
     key = _normalize_name(name)
