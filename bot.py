@@ -965,57 +965,223 @@ async def _get_text_channel(guild: discord.Guild, channel_id_str: str) -> Option
     except Exception:
         return None
 
-async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
-    """
-    Fetch gameserver status via Nitrado API.
-    Returns: (ok, payload)
-    """
-    if not NITRADO_TOKEN or not _is_digit_id(NITRADO_SERVICE_ID):
-        return False, {"error": "Nitrado not configured (NITRADO_TOKEN / NITRADO_SERVICE_ID)."}
-    url = f"https://api.nitrado.net/services/{NITRADO_SERVICE_ID}/gameservers"
-    headers = {"Authorization": f"Bearer {NITRADO_TOKEN}", "Accept": "application/json"}
+async def nitrado_status_call():
+    """Fetch Nitrado server status with robust field fallbacks.
 
+    Nitrado's API payload differs a bit between games and sometimes omits the `query`
+    object on some endpoints. This function tries a small set of endpoints and
+    extracts host/map/player info using multiple fallbacks so the status panel stays populated.
+    """
     try:
-        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.get(url) as resp:
-                data = await resp.json(content_type=None)
+        token = os.getenv("NITRADO_TOKEN")
+        service_id = os.getenv("NITRADO_SERVICE_ID")
+        if not token or not service_id:
+            return False, {"error": "Missing NITRADO_TOKEN or NITRADO_SERVICE_ID"}
 
-        # Nitrado's response nesting can vary; try to be defensive:
-        gs = {}
-        if isinstance(data, dict):
-            gs = (((data.get("data") or {}).get("gameserver")) or ((data.get("data") or {}).get("game_server")) or (data.get("data") or {})) or {}
-        query = gs.get("query") if isinstance(gs, dict) else None
-        if not isinstance(query, dict):
-            query = {}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
 
-        status_raw = str(gs.get("status") or "unknown").lower().strip() if isinstance(gs, dict) else "unknown"
-        hostname = (gs.get("hostname") if isinstance(gs, dict) else None) or (query.get("hostname") if isinstance(query, dict) else None)
-        game = (gs.get("game") if isinstance(gs, dict) else None) or (gs.get("game_short") if isinstance(gs, dict) else None)
-        map_name = (gs.get("map") if isinstance(gs, dict) else None) or (query.get("map") if isinstance(query, dict) else None)
-        ip = (gs.get("ip") if isinstance(gs, dict) else None) or (query.get("ip") if isinstance(query, dict) else None)
-        port = (gs.get("port") if isinstance(gs, dict) else None) or (query.get("port") if isinstance(query, dict) else None)
-
-        players = query.get("player_current") or query.get("players")
-        slots = query.get("player_max") or query.get("slots")
-
-        # coerce
-        def _to_int(x):
+        def _to_int(v):
             try:
-                return int(x)
+                if v is None:
+                    return None
+                if isinstance(v, bool):
+                    return int(v)
+                if isinstance(v, (int, float)):
+                    return int(v)
+                s = str(v).strip()
+                if s == "" or s == "-" or s.lower() == "none":
+                    return None
+                return int(float(s))
             except Exception:
                 return None
 
-        payload = {
-            "status": status_raw,
-            "hostname": str(hostname) if hostname else None,
-            "game": str(game) if game else None,
-            "map": str(map_name) if map_name else None,
-            "ip": str(ip) if ip else None,
-            "port": _to_int(port),
-            "players": _to_int(players),
-            "slots": _to_int(slots),
-        }
-        return True, payload
+        def _coalesce(*vals):
+            for v in vals:
+                if v is None:
+                    continue
+                if isinstance(v, str) and v.strip() in ("", "-", "none", "None"):
+                    continue
+                return v
+            return None
+
+        def _deep_find(obj, wanted_keys, max_nodes=5000):
+            """Return the first value for any key in `wanted_keys` found anywhere in obj."""
+            if not isinstance(wanted_keys, (set, list, tuple)):
+                wanted = {str(wanted_keys).lower()}
+            else:
+                wanted = {str(k).lower() for k in wanted_keys}
+
+            seen = 0
+            stack = [obj]
+            while stack and seen < max_nodes:
+                cur = stack.pop()
+                seen += 1
+                if isinstance(cur, dict):
+                    for k, v in cur.items():
+                        lk = str(k).lower()
+                        if lk in wanted:
+                            return v
+                        if isinstance(v, (dict, list)):
+                            stack.append(v)
+                elif isinstance(cur, list):
+                    for v in cur:
+                        if isinstance(v, (dict, list)):
+                            stack.append(v)
+            return None
+
+        async def _fetch_json(suffix: str):
+            url = f"https://api.nitrado.net/services/{service_id}/{suffix.lstrip('/')}"
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as resp:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = {"_raw": await resp.text()}
+                    return resp.status, data
+
+        def _extract_payload(raw):
+            # Nitrado generally wraps as {"data": {"gameserver": {...}}}
+            if not isinstance(raw, dict):
+                return None
+
+            data = raw.get("data")
+            if not isinstance(data, dict):
+                data = {}
+
+            gs = (
+                data.get("gameserver")
+                or data.get("game_server")
+                or data.get("gameservers")
+                or data
+            )
+            if not isinstance(gs, dict):
+                return None
+
+            query = gs.get("query") if isinstance(gs.get("query"), dict) else {}
+            settings = gs.get("settings") if isinstance(gs.get("settings"), dict) else {}
+
+            # Hostname / server name
+            hostname = _coalesce(
+                gs.get("hostname"),
+                gs.get("server_name"),
+                gs.get("name"),
+                query.get("hostname"),
+                query.get("server_name"),
+                query.get("name"),
+                _deep_find(gs, {"hostname", "server_name", "servername", "name"}),
+            )
+
+            # Game identifier
+            game = _coalesce(
+                gs.get("game"),
+                gs.get("game_short"),
+                gs.get("game_id"),
+                query.get("game"),
+                query.get("game"),
+                _deep_find(gs, {"game", "game_short", "gameid", "game_id"}),
+            )
+
+            # Map (ark/asa varies)
+            map_name = _coalesce(
+                query.get("map"),
+                query.get("map_name"),
+                query.get("level"),
+                query.get("level_name"),
+                settings.get("map"),
+                settings.get("map_name"),
+                gs.get("map"),
+                gs.get("map_name"),
+                _deep_find(gs, {"map", "map_name", "level", "level_name", "mapname"}),
+            )
+
+            # Players / slots
+            players = _coalesce(
+                query.get("players"),
+                query.get("player_current"),
+                query.get("players_current"),
+                query.get("numplayers"),
+                query.get("num_players"),
+                gs.get("players"),
+                gs.get("player_current"),
+                _deep_find(gs, {"players", "player_current", "players_current", "numplayers", "num_players"}),
+            )
+            slots = _coalesce(
+                query.get("slots"),
+                query.get("player_max"),
+                query.get("players_max"),
+                query.get("maxplayers"),
+                query.get("max_players"),
+                gs.get("slots"),
+                gs.get("player_max"),
+                _deep_find(gs, {"slots", "player_max", "players_max", "maxplayers", "max_players"}),
+            )
+
+            ip = _coalesce(
+                query.get("ip"),
+                query.get("ip_address"),
+                gs.get("ip"),
+                gs.get("ip_address"),
+                _deep_find(gs, {"ip", "ip_address", "ipaddress"}),
+            )
+            port = _coalesce(
+                query.get("port"),
+                gs.get("port"),
+                _deep_find(gs, {"port"}),
+            )
+
+            status_txt = _coalesce(
+                gs.get("status"),
+                query.get("status"),
+                _deep_find(gs, {"status", "state"}),
+            )
+
+            payload = {
+                "status": status_txt,
+                "hostname": hostname,
+                "game": game,
+                "map": map_name,
+                "ip": ip,
+                "port": _to_int(port),
+                "players": _to_int(players),
+                "slots": _to_int(slots),
+            }
+            return payload
+
+        best = None
+        best_score = -1
+
+        # Try a few endpoints; whichever yields the richest payload wins.
+        for suffix in (
+            "gameservers",
+            "gameservers/gameserver",
+            "gameservers/gameserver/status",
+            "gameserver",
+        ):
+            status_code, raw = await _fetch_json(suffix)
+            if status_code >= 400:
+                continue
+
+            payload = _extract_payload(raw)
+            if not payload:
+                continue
+
+            score = sum(1 for k in ("hostname", "map", "players", "slots", "ip", "port") if payload.get(k) not in (None, "", "-"))
+            if score > best_score:
+                best = payload
+                best_score = score
+
+            # If we have the critical fields, stop early.
+            if payload.get("players") is not None and payload.get("slots") is not None and payload.get("map") not in (None, "", "-"):
+                return True, payload
+
+        if best:
+            return True, best
+
+        return False, {"error": "Unable to fetch status from Nitrado (no usable payload)"}
     except Exception as e:
         return False, {"error": repr(e)}
 
