@@ -5,6 +5,7 @@ import traceback
 import io
 import re
 import random
+import math
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple, Set, Any
@@ -3420,7 +3421,7 @@ def _build_tame_calc_embed(guild: discord.Guild, settings: CalcSettings) -> disc
         f"Taming Speed: **{settings.taming_speed}x**",
         f"Food Drain: **{settings.food_drain}x**",
         f"Single Player Settings: **{'ON' if settings.use_single_player_settings else 'OFF'}**",
-        "Use **Calculate** below, then follow the link for exact food / narcotics / time.",
+        "Use **Calculate** below to get food, time, narcotics, and a KO estimate (based on standard weapon damage).",
     ]
     e = discord.Embed(
         title="🦖 Democracy Ark — Tame Calculator",
@@ -3510,35 +3511,494 @@ class CalcSettingsView(discord.ui.View):
             pass
         await interaction.response.send_message("✅ Reset to defaults.", ephemeral=True)
 
+# ---- Taming data (auto-loaded from ARK Wiki/Fandom Module:TamingTable) ----
+_TAMING_CREATURES: Optional[Dict[str, Any]] = None
+_TAMING_FOOD: Optional[Dict[str, Any]] = None
+_TAMING_LOADED_AT: int = 0
+_TAMING_LOCK = asyncio.Lock()
+
+_TAMING_CREATURES_RAW_URL = "https://ark.fandom.com/wiki/Module:TamingTable/creatures?action=raw"
+_TAMING_FOOD_RAW_URL = "https://ark.fandom.com/wiki/Module:TamingTable/food?action=raw"
+
+async def _fetch_text(url: str, timeout_s: int = 25) -> str:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers={"User-Agent": "DemocracyBot/1.0"}) as resp:
+            resp.raise_for_status()
+            return await resp.text()
+
+def _lua_strip_comments(src: str) -> str:
+    # Modules are usually comment-light; keep simple: strip full-line and inline "--" comments.
+    out_lines: List[str] = []
+    for line in src.splitlines():
+        if "--" in line:
+            # keep strings safe by only stripping when '--' appears before any quote
+            dq = line.find('"')
+            sq = line.find("'")
+            first_quote = min([x for x in [dq, sq] if x != -1], default=-1)
+            comment_at = line.find("--")
+            if comment_at != -1 and (first_quote == -1 or comment_at < first_quote):
+                line = line[:comment_at]
+        if line.strip().startswith("--"):
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+_LUA_TOKEN_RE = re.compile(
+    r'\s*(?:(\{)|(\})|(\[)|(\])|(=)|(,)|("([^"\\]|\\.)*")|(-?\d+\.\d+|-?\d+)|(\btrue\b|\bfalse\b|\bnil\b)|([A-Za-z_][A-Za-z0-9_]*))',
+    re.IGNORECASE,
+)
+
+def _lua_tokenize(src: str) -> List[str]:
+    tokens: List[str] = []
+    i = 0
+    n = len(src)
+    while i < n:
+        m = _LUA_TOKEN_RE.match(src, i)
+        if not m:
+            # skip unknown whitespace/characters (should be rare in these modules)
+            i += 1
+            continue
+        tok = next((g for g in m.groups() if g is not None), None)
+        if tok is not None:
+            tokens.append(tok)
+        i = m.end()
+    return tokens
+
+def _lua_unescape_string(s: str) -> str:
+    # s includes surrounding quotes
+    try:
+        return bytes(s[1:-1], "utf-8").decode("unicode_escape")
+    except Exception:
+        return s[1:-1]
+
+def _lua_parse_value(tokens: List[str], idx: int):
+    if idx >= len(tokens):
+        raise ValueError("Unexpected EOF")
+    t = tokens[idx]
+    if t == "{":
+        return _lua_parse_table(tokens, idx + 1)
+    if t.startswith('"') and t.endswith('"'):
+        return _lua_unescape_string(t), idx + 1
+    if re.fullmatch(r"-?\d+\.\d+|-?\d+", t):
+        return float(t) if "." in t else int(t), idx + 1
+    tl = t.lower()
+    if tl == "true":
+        return True, idx + 1
+    if tl == "false":
+        return False, idx + 1
+    if tl == "nil":
+        return None, idx + 1
+    # identifier as bare string (rare)
+    return t, idx + 1
+
+def _lua_parse_table(tokens: List[str], idx: int):
+    items: List[Any] = []
+    d: Dict[Any, Any] = {}
+    keyed = False
+
+    while idx < len(tokens):
+        t = tokens[idx]
+        if t == "}":
+            return (d if keyed else items), idx + 1
+
+        # keyed entry: ["key"] = value
+        if t == "[":
+            key_val, idx = _lua_parse_value(tokens, idx + 1)
+            if tokens[idx] != "]":
+                raise ValueError("Expected ']'")
+            if tokens[idx + 1] != "=":
+                raise ValueError("Expected '='")
+            val, idx2 = _lua_parse_value(tokens, idx + 2)
+            d[key_val] = val
+            keyed = True
+            idx = idx2
+        # keyed entry: ident = value  (rare here)
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t) and (idx + 1 < len(tokens) and tokens[idx + 1] == "="):
+            key = t
+            val, idx2 = _lua_parse_value(tokens, idx + 2)
+            d[key] = val
+            keyed = True
+            idx = idx2
+        else:
+            val, idx2 = _lua_parse_value(tokens, idx)
+            items.append(val)
+            idx = idx2
+
+        # optional comma
+        if idx < len(tokens) and tokens[idx] == ",":
+            idx += 1
+
+    raise ValueError("Unclosed table")
+
+def _lua_parse_return_table(lua_src: str) -> Dict[str, Any]:
+    # Find the "return { ... }" segment and parse its table.
+    src = _lua_strip_comments(lua_src)
+    m = re.search(r"\breturn\s*\{", src)
+    if not m:
+        raise ValueError("No return table found")
+    start = m.end() - 1  # points at '{'
+    tokens = _lua_tokenize(src[start:])
+    value, next_idx = _lua_parse_value(tokens, 0)
+    if not isinstance(value, dict):
+        raise ValueError("Expected dict at top level")
+    return value
+
+async def ensure_taming_data_loaded(force: bool = False) -> bool:
+    global _TAMING_CREATURES, _TAMING_FOOD, _TAMING_LOADED_AT
+    # refresh every 7 days (or on demand)
+    if not force and _TAMING_CREATURES and _TAMING_FOOD and (time.time() - _TAMING_LOADED_AT) < 7 * 24 * 3600:
+        return True
+    async with _TAMING_LOCK:
+        if not force and _TAMING_CREATURES and _TAMING_FOOD and (time.time() - _TAMING_LOADED_AT) < 7 * 24 * 3600:
+            return True
+        try:
+            creatures_src, food_src = await asyncio.gather(
+                _fetch_text(_TAMING_CREATURES_RAW_URL),
+                _fetch_text(_TAMING_FOOD_RAW_URL),
+            )
+            _TAMING_CREATURES = _lua_parse_return_table(creatures_src)
+            _TAMING_FOOD = _lua_parse_return_table(food_src)
+            _TAMING_LOADED_AT = int(time.time())
+            print(f"✅ TAME: loaded {len(_TAMING_CREATURES)} creatures + {len(_TAMING_FOOD)} foods from wiki modules.", flush=True)
+            return True
+        except Exception:
+            print("⚠️ TAME: failed to load wiki taming data, falling back to link-only mode.\n" + traceback.format_exc(), flush=True)
+            _TAMING_CREATURES = None
+            _TAMING_FOOD = None
+            return False
+
+def _normalize_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.strip().lower())
+
+def _resolve_creature_key(user_input: str) -> Optional[str]:
+    if not _TAMING_CREATURES:
+        return None
+    want = _normalize_name(user_input)
+    if not want:
+        return None
+    # exact-ish match first
+    for k in _TAMING_CREATURES.keys():
+        if _normalize_name(k) == want:
+            return k
+    # contains match
+    for k in _TAMING_CREATURES.keys():
+        nk = _normalize_name(k)
+        if want in nk or nk in want:
+            return k
+    # very small fuzzy: first 8 chars
+    want8 = want[:8]
+    for k in _TAMING_CREATURES.keys():
+        if _normalize_name(k).startswith(want8):
+            return k
+    return None
+
+def _pick_food(creature_data: Dict[str, Any], food_pref: str) -> Optional[str]:
+    eats = creature_data.get("eats") or []
+    if not isinstance(eats, list):
+        return None
+    pref = food_pref.strip().lower()
+    if not pref:
+        # default: kibble if available, else first listed
+        if "Kibble" in eats:
+            return "Kibble"
+        return eats[0] if eats else None
+
+    # simple keyword mapping
+    mapping = {
+        "kibble": "Kibble",
+        "mutton": "Raw Mutton",
+        "prime": "Raw Prime Meat",
+        "raw prime": "Raw Prime Meat",
+        "prime meat": "Raw Prime Meat",
+        "raw meat": "Raw Meat",
+        "meat": "Raw Meat",
+        "fish": "Raw Fish Meat",
+        "prime fish": "Raw Prime Fish Meat",
+        "berry": "Mejoberry",
+        "berries": "Mejoberry",
+        "mejo": "Mejoberry",
+        "crop": "Vegetables",
+        "vegetable": "Vegetables",
+        "veggie": "Vegetables",
+        "spoiled": "Spoiled Meat",
+        "cake": "Sweet Vegetable Cake",
+    }
+    for key, val in mapping.items():
+        if key in pref:
+            if val in eats:
+                return val
+    # direct match against eats
+    for f in eats:
+        if pref == str(f).strip().lower():
+            return f
+    # contains match
+    for f in eats:
+        if pref in str(f).lower():
+            return f
+    return eats[0] if eats else None
+
+def _format_hms(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def _weapon_from_text(s: str) -> str:
+    t = (s or "").lower()
+    if "shocking" in t:
+        return "shocking_dart"
+    if "dart" in t or "longneck" in t or "rifle" in t:
+        return "tranq_dart"
+    if "crossbow" in t:
+        return "crossbow_arrow"
+    if "bow" in t:
+        return "bow_arrow"
+    if "club" in t:
+        return "club"
+    return "crossbow_arrow"
+
+_WEAPON_TORPOR_100 = {
+    # Totals at 100% weapon damage from ARK wiki comparison table.
+    "bow_arrow": 90.0,
+    "crossbow_arrow": 157.5,
+    "tranq_dart": 221.0,
+    "shocking_dart": 442.0,
+    # A rough placeholder (varies a lot); keep but label as estimate.
+    "club": 50.0,
+}
+
+def _weapon_label(key: str) -> str:
+    return {
+        "bow_arrow": "Bow + Tranq Arrow",
+        "crossbow_arrow": "Crossbow + Tranq Arrow",
+        "tranq_dart": "Longneck + Tranq Dart",
+        "shocking_dart": "Longneck + Shocking Tranq Dart",
+        "club": "Wooden Club (rough estimate)",
+    }.get(key, key)
+
+def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_pref: str, weapon_text: str, weapon_damage_pct: float):
+    """Compute food/time/torpor/narcotics using the same parameters as the wiki TamingTable module, adjusted for server multipliers."""
+    if not _TAMING_CREATURES or not _TAMING_FOOD:
+        raise RuntimeError("taming data not loaded")
+
+    c = _TAMING_CREATURES.get(creature_key)
+    if not isinstance(c, dict):
+        raise RuntimeError("unknown creature")
+
+    level = max(1, int(level))
+    taming_speed = max(0.1, float(settings.taming_speed or 1.0))
+    food_drain_mult = max(0.1, float(settings.food_drain or 1.0))
+
+    # required affinity
+    affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level)
+
+    # pick food
+    food_key = _pick_food(c, food_pref) or ""
+    foodname_disp = food_key
+    if food_key == "Kibble":
+        fav = c.get("favoriteKibble") or "Kibble"
+        foodname_disp = f"{fav} Kibble"
+
+    # resolve affinity + foodValue
+    food_affinity = 0.0
+    food_value = 0.0
+    sfv = c.get("specialFoodValues") or {}
+    if isinstance(sfv, dict) and food_key in sfv and isinstance(sfv[food_key], dict):
+        food_affinity = float(sfv[food_key].get("affinity") or 0.0)
+        food_value = float(sfv[food_key].get("value") or 0.0)
+
+    fdat = _TAMING_FOOD.get(food_key) if isinstance(_TAMING_FOOD, dict) else None
+    if isinstance(fdat, dict):
+        if food_affinity == 0.0:
+            food_affinity = float(fdat.get("affinity") or 0.0)
+        if food_value == 0.0:
+            food_value = float(fdat.get("foodValue") or 0.0)
+
+    if food_affinity <= 0 or food_value == 0:
+        raise RuntimeError("unsupported food for this creature")
+
+    # wiki module multiplies affinity by 4 (post-2020 change)
+    non_violent = bool(c.get("nonViolentTame") == 1)
+    wake_aff_mult = float(c.get("wakeAffinityMult") or 1.0) if non_violent else 1.0
+    wake_food_mult = float(c.get("wakeFoodDeplMult") or 1.0) if non_violent else 1.0
+
+    food_affinity_eff = food_affinity * wake_aff_mult * 4.0 * taming_speed
+    food_value_eff = food_value * wake_food_mult
+
+    food_pieces = int(math.ceil(affinity_needed / food_affinity_eff))
+
+    # time: either constantFeedingInterval, else based on food drain
+    if c.get("constantFeedingInterval") is not None:
+        seconds = int(float(c.get("constantFeedingInterval")) * food_pieces)
+    else:
+        base = float(c.get("foodConsumptionBase") or 0.0)
+        mult = float(c.get("foodConsumptionMult") or 0.0)
+        denom = base * mult * food_drain_mult
+        if denom <= 0:
+            seconds = 0
+        else:
+            seconds = int(math.ceil(food_pieces * abs(food_value_eff) / denom))
+
+    # correction hacks used on wiki
+    if c.get("resultCorrection") is not None:
+        try:
+            seconds = int(float(seconds) * float(c.get("resultCorrection")))
+        except Exception:
+            pass
+
+    # torpor + narcos only for KO tames
+    torpor_block = None
+    if not non_violent:
+        total_torpor = float(c.get("torpor1") or 0.0) + float(c.get("torporIncrease") or 0.0) * float(level - 1)
+        torpor_ps0 = float(c.get("torporDepletionPS0") or 0.0)
+        torpor_depl_ps = 0.0
+        if torpor_ps0 > 0 and level > 1:
+            torpor_depl_ps = torpor_ps0 + math.exp(0.800403041 * math.log(level - 1)) / (22.39671632 / torpor_ps0)
+        elif torpor_ps0 > 0:
+            torpor_depl_ps = torpor_ps0
+
+        torpor_needed = max(0, int(math.ceil(torpor_depl_ps * seconds - total_torpor))) if torpor_depl_ps > 0 else 0
+
+        narco_berries = int(math.ceil(torpor_needed / (7.5 + 3 * torpor_depl_ps))) if torpor_depl_ps > 0 else 0
+        narcotics = int(math.ceil(torpor_needed / (40 + 8 * torpor_depl_ps))) if torpor_depl_ps > 0 else 0
+        bio_toxin = int(math.ceil(torpor_needed / (80 + 16 * torpor_depl_ps))) if torpor_depl_ps > 0 else 0
+
+        # KO estimate
+        weapon_key = _weapon_from_text(weapon_text)
+        base_torpor = float(_WEAPON_TORPOR_100.get(weapon_key) or 0.0)
+        dmg_mult = max(0.1, float(weapon_damage_pct or 100.0) / 100.0)
+        shots = int(math.ceil(total_torpor / (base_torpor * dmg_mult))) if base_torpor > 0 else None
+
+        torpor_block = {
+            "total_torpor": total_torpor,
+            "torpor_depl_ps": torpor_depl_ps,
+            "torpor_needed": torpor_needed,
+            "narco_berries": narco_berries,
+            "narcotics": narcotics,
+            "bio_toxin": bio_toxin,
+            "weapon_key": weapon_key,
+            "weapon_label": _weapon_label(weapon_key),
+            "weapon_damage_pct": weapon_damage_pct,
+            "shots": shots,
+        }
+
+    return {
+        "creature_key": creature_key,
+        "food_key": food_key,
+        "food_display": foodname_disp,
+        "food_pieces": food_pieces,
+        "seconds": seconds,
+        "non_violent": non_violent,
+        "torpor": torpor_block,
+    }
+
 class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
     creature = discord.ui.TextInput(label="Creature (e.g. Raptor)", placeholder="Raptor", required=True, max_length=60)
     level = discord.ui.TextInput(label="Wild Level (e.g. 150)", placeholder="150", required=True, max_length=10)
-    food = discord.ui.TextInput(label="Food (optional, e.g. kibble / mutton)", placeholder="kibble", required=False, max_length=60)
-    notes = discord.ui.TextInput(label="KO method / notes (optional)", placeholder="tranq arrows, trap, etc", required=False, max_length=120)
+    food = discord.ui.TextInput(label="Food (optional: kibble/mutton/prime/meat/berries)", placeholder="kibble", required=False, max_length=60)
+    weapon = discord.ui.TextInput(label="KO Weapon (optional: crossbow/bow/dart/shocking)", placeholder="crossbow", required=False, max_length=30)
+    weapon_damage = discord.ui.TextInput(label="Weapon Damage % (optional, default 100)", placeholder="100", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
         creature_name = str(self.creature.value).strip()
-        slug = _slugify_creature(creature_name)
         try:
             lvl = int(re.sub(r"[^0-9]", "", str(self.level.value))) if str(self.level.value).strip() else 1
         except Exception:
             lvl = 1
         settings = await calc_get_settings(interaction.guild_id)
-        url = f"https://www.dododex.com/taming/{slug}" if slug else "https://www.dododex.com/"
 
-        desc_lines = [
-            f"**Creature:** {creature_name}",
+        # Attempt to load data; if it fails, fall back to link-only mode (no manual input required beyond clicking).
+        ok = await ensure_taming_data_loaded()
+        if not ok:
+            slug = _slugify_creature(creature_name)
+            url = f"https://www.dododex.com/taming/{slug}" if slug else "https://www.dododex.com/"
+            desc_lines = [
+                f"**Creature:** {creature_name}",
+                f"**Wild Level:** {lvl}",
+                f"**Server Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**",
+                "",
+                "⚠️ Calculator data failed to load right now, so here’s a quick link:",
+            ]
+            e = discord.Embed(title="🧮 Tame Calculation (Link Mode)", description="\n".join(desc_lines), color=0x3498DB)
+            e.add_field(name="Dododex", value=url, inline=False)
+            e.timestamp = datetime.utcnow()
+            await interaction.response.send_message(embed=e, ephemeral=True)
+            return
+
+        creature_key = _resolve_creature_key(creature_name)
+        if not creature_key:
+            await interaction.response.send_message(
+                f"❌ I couldn't find that creature. Try a simpler name (example: **Raptor**, **Argentavis**, **Ankylosaurus**).",
+                ephemeral=True,
+            )
+            return
+
+        wtxt = str(self.weapon.value).strip()
+        try:
+            w_dmg = float(re.sub(r"[^0-9.]", "", str(self.weapon_damage.value))) if str(self.weapon_damage.value).strip() else 100.0
+        except Exception:
+            w_dmg = 100.0
+
+        try:
+            result = _compute_taming(
+                creature_key=creature_key,
+                level=lvl,
+                settings=settings,
+                food_pref=str(self.food.value or "").strip(),
+                weapon_text=wtxt,
+                weapon_damage_pct=w_dmg,
+            )
+        except Exception:
+            await interaction.response.send_message(
+                "❌ I couldn't calculate that tame with the options provided. Try a different food (or leave it blank).",
+                ephemeral=True,
+            )
+            return
+
+        lines = [
+            f"**Creature:** {creature_key}",
             f"**Wild Level:** {lvl}",
-            f"**Your Server Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**, SP Settings **{'ON' if settings.use_single_player_settings else 'OFF'}**",
+            f"**Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**",
+            f"**Food:** {result['food_display']} × **{result['food_pieces']}**",
+            f"**Estimated Time:** **{_format_hms(result['seconds'])}**",
         ]
-        if str(self.food.value).strip():
-            desc_lines.append(f"**Food preference:** {str(self.food.value).strip()}")
-        if str(self.notes.value).strip():
-            desc_lines.append(f"**Notes:** {str(self.notes.value).strip()}")
-        desc_lines.append("\nOpen the Dododex link and set the same multipliers + level for exact food, narcotics, and time.")
-        e = discord.Embed(title="🧮 Tame Calculation", description="\n".join(desc_lines), color=0x3498DB)
-        e.add_field(name="Dododex", value=url, inline=False)
+
+        e = discord.Embed(title="🦖 Democracy Ark — Tame Calculator", description="\n".join(lines), color=0x2ECC71)
         e.timestamp = datetime.utcnow()
+
+        if result["non_violent"]:
+            e.add_field(
+                name="Notes",
+                value="This creature uses **non-violent** taming. Torpor / narcotics are not required.",
+                inline=False,
+            )
+        else:
+            t = result["torpor"] or {}
+            if t:
+                e.add_field(
+                    name="Keep it asleep",
+                    value=(
+                        f"Total Torpor: **{int(t['total_torpor'])}**\n"
+                        f"Torpor drain: **{t['torpor_depl_ps']:.2f}/s**\n"
+                        f"Extra Torpor needed during tame: **{int(t['torpor_needed'])}**\n"
+                        f"Narcoberries: **{t['narco_berries']}** • Narcotics: **{t['narcotics']}** • Bio Toxin: **{t['bio_toxin']}**"
+                    ),
+                    inline=False,
+                )
+                if t.get("shots") is not None:
+                    e.add_field(
+                        name="KO estimate (rough)",
+                        value=f"{t['weapon_label']} @ **{t['weapon_damage_pct']:.0f}%** → **~{t['shots']}** shots/hits (100% accuracy, no headshot modifiers).",
+                        inline=False,
+                    )
+
+        e.set_footer(text="Estimates use official wiki taming tables, adjusted by your server multipliers.")
         await interaction.response.send_message(embed=e, ephemeral=True)
 
 class TameCalculatorView(discord.ui.View):
