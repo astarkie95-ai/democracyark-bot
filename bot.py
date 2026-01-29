@@ -2108,6 +2108,28 @@ def _module_box(header: str, lines: List[str]) -> str:
         "```"
     )
 
+def _fmt_seconds(total_seconds: int) -> str:
+    """Format seconds into a human-friendly duration."""
+    try:
+        s = int(round(float(total_seconds)))
+    except Exception:
+        return "—"
+    if s <= 0:
+        return "0s"
+    days, rem = divmod(s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    if days > 0:
+        # Keep it compact for Discord embeds
+        return f"{days}d {hours}h {minutes}m"
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes > 0:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
 def _starter_panel_channel_id() -> str:
     return STARTER_PANEL_CHANNEL_ID if _is_digit_id(STARTER_PANEL_CHANNEL_ID) else CLAIM_CHANNEL_ID
 
@@ -4529,12 +4551,23 @@ def _creature_letter_groups(keys: List[str]) -> Dict[str, List[str]]:
     return dict(sorted(groups.items(), key=lambda kv: kv[0]))
 
 async def _ensure_calc_data(interaction: discord.Interaction) -> bool:
-    # Make sure wiki data is ready; always defer to avoid timeouts.
+    """Ensure taming + breeding datasets are loaded.
+
+    Important UX note:
+    - We only defer (which shows 'Bot is thinking…') when we actually need to load remote data.
+    - Once data is cached in memory, dropdown clicks should respond instantly without the thinking banner.
+    """
+    # Fast path: already loaded in memory
+    if _TAMING_CREATURES and _TAMING_FOOD and _BREEDING_DATA:
+        return True
+
+    # If we need to fetch, defer to avoid the 3s interaction timeout.
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception:
         pass
+
     ok1 = await ensure_taming_data_loaded()
     ok2 = await ensure_breeding_data_loaded()
     return bool(ok1 and ok2)
