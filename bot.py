@@ -117,6 +117,17 @@ ROLE_MANAGER_MESSAGE_ID = os.getenv("ROLE_MANAGER_MESSAGE_ID", "").strip()
 ROLE_MANAGER_PIN = os.getenv("ROLE_MANAGER_PIN", "0").strip().lower() in ("1","true","yes","on")
 
 SELF_ROLES_CSV_PATH = os.getenv("SELF_ROLES_CSV_PATH", "self_roles.csv").strip()
+# ✅ NEW: Tame Calculator modules
+# - TAME_CALC_CHANNEL_ID: public channel where the calculator panel lives (e.g. #tame-calculator)
+# - TAME_CALC_MESSAGE_ID: message id to keep editing (optional)
+# - CALC_SETTINGS_CHANNEL_ID: staff channel for calculator settings (e.g. #calc-settings)
+# - CALC_SETTINGS_MESSAGE_ID: message id to keep editing (optional)
+# If channel IDs are not set, the bot will try to find channels by name ("tame-calculator" / "calc-settings") within your guild.
+TAME_CALC_CHANNEL_ID = os.getenv("TAME_CALC_CHANNEL_ID", "").strip()
+TAME_CALC_MESSAGE_ID = os.getenv("TAME_CALC_MESSAGE_ID", "").strip()
+CALC_SETTINGS_CHANNEL_ID = os.getenv("CALC_SETTINGS_CHANNEL_ID", "").strip()
+CALC_SETTINGS_MESSAGE_ID = os.getenv("CALC_SETTINGS_MESSAGE_ID", "").strip()
+
 # ✅ NEW: Poll module channels split (optional)
 # - POLL_CREATE_CHANNEL_ID: where the Poll PANEL lives (private staff channel, e.g. #create-poll)
 # - POLL_VOTE_CHANNEL_ID  : where polls are posted for players to vote (public, e.g. #vote)
@@ -455,6 +466,8 @@ class DemocracyBot(commands.Bot):
             self.add_view(GetRoleView())
             self.add_view(SelfRolesView())
             self.add_view(RoleManagerView())
+            self.add_view(TameCalculatorView())
+            self.add_view(CalcSettingsView())
             print("TICKETS: persistent views registered", flush=True)
         except Exception:
             print("TICKETS: failed to register views:", traceback.format_exc(), flush=True)
@@ -676,6 +689,17 @@ async def db_init() -> None:
                     label TEXT NOT NULL,
                     description TEXT NOT NULL DEFAULT '',
                     added_at BIGINT NOT NULL
+                );
+            """)
+
+            # ✅ NEW: Tame calculator settings (kept tiny so it stays within free Neon limits)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS calc_settings (
+                    guild_id BIGINT PRIMARY KEY,
+                    taming_speed DOUBLE PRECISION NOT NULL DEFAULT 5.0,
+                    food_drain DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                    use_single_player_settings BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at BIGINT NOT NULL DEFAULT 0
                 );
             """)
             print("✅ DB: tables ensured.", flush=True)
@@ -2922,6 +2946,9 @@ async def refresh_poll_panel(guild: discord.Guild, vote_channel_id: int) -> None
 
 _GET_ROLE_MESSAGE_ID_RUNTIME: int = int(GET_ROLE_MESSAGE_ID) if _is_digit_id(GET_ROLE_MESSAGE_ID) else 0
 _ROLE_MANAGER_MESSAGE_ID_RUNTIME: int = int(ROLE_MANAGER_MESSAGE_ID) if _is_digit_id(ROLE_MANAGER_MESSAGE_ID) else 0
+_TAME_CALC_MESSAGE_ID_RUNTIME: int = int(TAME_CALC_MESSAGE_ID) if _is_digit_id(TAME_CALC_MESSAGE_ID) else 0
+_CALC_SETTINGS_MESSAGE_ID_RUNTIME: int = int(CALC_SETTINGS_MESSAGE_ID) if _is_digit_id(CALC_SETTINGS_MESSAGE_ID) else 0
+
 
 def _role_manager_channel_id() -> str:
     # Default to the existing server control panel channel if not specified
@@ -3297,6 +3324,271 @@ async def ensure_role_manager_panel(guild: discord.Guild) -> None:
     if msg_id and msg_id != _ROLE_MANAGER_MESSAGE_ID_RUNTIME:
         _ROLE_MANAGER_MESSAGE_ID_RUNTIME = msg_id
         print(f"[ROLEMAN] New ROLE_MANAGER_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
+
+# =====================================================================
+# ✅ NEW: Tame Calculator (public) + Calc Settings (staff)
+# =====================================================================
+
+@dataclass
+class CalcSettings:
+    taming_speed: float = 5.0
+    food_drain: float = 1.0
+    use_single_player_settings: bool = False
+
+async def calc_get_settings(guild_id: int) -> CalcSettings:
+    """Fetch calc settings from DB; fall back to defaults if missing."""
+    if not DB_POOL:
+        return CalcSettings()
+    try:
+        async with DB_POOL.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT taming_speed, food_drain, use_single_player_settings
+                FROM calc_settings
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+            if not row:
+                # Create default row lazily
+                await conn.execute(
+                    """
+                    INSERT INTO calc_settings (guild_id, taming_speed, food_drain, use_single_player_settings, updated_at)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (guild_id) DO NOTHING
+                    """,
+                    guild_id,
+                    float(CalcSettings.taming_speed),
+                    float(CalcSettings.food_drain),
+                    bool(CalcSettings.use_single_player_settings),
+                    int(time.time()),
+                )
+                return CalcSettings()
+            return CalcSettings(
+                taming_speed=float(row["taming_speed"]) if row["taming_speed"] is not None else 5.0,
+                food_drain=float(row["food_drain"]) if row["food_drain"] is not None else 1.0,
+                use_single_player_settings=bool(row["use_single_player_settings"]) if row["use_single_player_settings"] is not None else False,
+            )
+    except Exception:
+        return CalcSettings()
+
+async def calc_set_settings(guild_id: int, settings: CalcSettings) -> None:
+    if not DB_POOL:
+        return
+    try:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO calc_settings (guild_id, taming_speed, food_drain, use_single_player_settings, updated_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (guild_id) DO UPDATE
+                SET taming_speed = EXCLUDED.taming_speed,
+                    food_drain = EXCLUDED.food_drain,
+                    use_single_player_settings = EXCLUDED.use_single_player_settings,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                guild_id,
+                float(settings.taming_speed),
+                float(settings.food_drain),
+                bool(settings.use_single_player_settings),
+                int(time.time()),
+            )
+    except Exception:
+        pass
+
+def _find_channel_by_name(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
+    for ch in guild.text_channels:
+        if ch.name.lower() == name.lower():
+            return ch
+    return None
+
+async def _resolve_text_channel(guild: discord.Guild, channel_id_str: str, fallback_name: str) -> Optional[discord.TextChannel]:
+    ch = await _get_text_channel(guild, channel_id_str) if _is_digit_id(channel_id_str) else None
+    if ch:
+        return ch
+    return _find_channel_by_name(guild, fallback_name)
+
+def _slugify_creature(name: str) -> str:
+    s = name.strip().lower()
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9\-]", "", s)
+    s = re.sub(r"\-+", "-", s).strip("-")
+    return s
+
+def _build_tame_calc_embed(guild: discord.Guild, settings: CalcSettings) -> discord.Embed:
+    lines = [
+        f"Taming Speed: **{settings.taming_speed}x**",
+        f"Food Drain: **{settings.food_drain}x**",
+        f"Single Player Settings: **{'ON' if settings.use_single_player_settings else 'OFF'}**",
+        "Use **Calculate** below, then follow the link for exact food / narcotics / time.",
+    ]
+    e = discord.Embed(
+        title="🦖 Democracy Ark — Tame Calculator",
+        description=_module_box("TAME CALCULATOR", lines),
+        color=0x2ECC71,
+    )
+    e.set_footer(text="Powered by your server rates • Ragnarok")
+    e.timestamp = datetime.utcnow()
+    return e
+
+def _build_calc_settings_embed(guild: discord.Guild, settings: CalcSettings) -> discord.Embed:
+    lines = [
+        f"Taming Speed: **{settings.taming_speed}x**",
+        f"Food Drain: **{settings.food_drain}x**",
+        f"Single Player Settings: **{'ON' if settings.use_single_player_settings else 'OFF'}**",
+        "Staff: update these so the public calculator panel stays accurate.",
+        "(Uses DB if available; otherwise defaults are used.)",
+    ]
+    e = discord.Embed(
+        title="⚙️ Democracy Bot — Calculator Settings (Staff)",
+        description=_module_box("CALC SETTINGS", lines),
+        color=0xF1C40F,
+    )
+    e.timestamp = datetime.utcnow()
+    return e
+
+class _CalcSettingsModal(discord.ui.Modal, title="Set Calculator Rates"):
+    taming_speed = discord.ui.TextInput(label="Taming Speed (e.g. 5)", placeholder="5", required=True, max_length=10)
+    food_drain = discord.ui.TextInput(label="Food Drain (e.g. 1)", placeholder="1", required=True, max_length=10)
+    single_player = discord.ui.TextInput(label="Use Single Player Settings? (yes/no)", placeholder="no", required=True, max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            ts = float(str(self.taming_speed.value).strip())
+        except Exception:
+            ts = 5.0
+        try:
+            fd = float(str(self.food_drain.value).strip())
+        except Exception:
+            fd = 1.0
+        sp = str(self.single_player.value).strip().lower() in ("1", "true", "yes", "y", "on")
+        await calc_set_settings(interaction.guild_id, CalcSettings(taming_speed=ts, food_drain=fd, use_single_player_settings=sp))
+        # refresh both panels
+        try:
+            await ensure_calc_settings_panel(interaction.guild)
+            await ensure_tame_calculator_panel(interaction.guild)
+        except Exception:
+            pass
+        await interaction.response.send_message("✅ Calculator settings updated.", ephemeral=True)
+
+class CalcSettingsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ Server context required.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        if not is_staff_member(interaction.user):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("🔒 Staff only.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    @discord.ui.button(label="Set Rates", style=discord.ButtonStyle.primary, custom_id="calc_settings:set_rates")
+    async def set_rates(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_CalcSettingsModal())
+
+    @discord.ui.button(label="Reset to Defaults", style=discord.ButtonStyle.secondary, custom_id="calc_settings:reset_defaults")
+    async def reset_defaults(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await calc_set_settings(interaction.guild_id, CalcSettings())
+        try:
+            await ensure_calc_settings_panel(interaction.guild)
+            await ensure_tame_calculator_panel(interaction.guild)
+        except Exception:
+            pass
+        await interaction.response.send_message("✅ Reset to defaults.", ephemeral=True)
+
+class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
+    creature = discord.ui.TextInput(label="Creature (e.g. Raptor)", placeholder="Raptor", required=True, max_length=60)
+    level = discord.ui.TextInput(label="Wild Level (e.g. 150)", placeholder="150", required=True, max_length=10)
+    food = discord.ui.TextInput(label="Food (optional, e.g. kibble / mutton)", placeholder="kibble", required=False, max_length=60)
+    notes = discord.ui.TextInput(label="KO method / notes (optional)", placeholder="tranq arrows, trap, etc", required=False, max_length=120)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        creature_name = str(self.creature.value).strip()
+        slug = _slugify_creature(creature_name)
+        try:
+            lvl = int(re.sub(r"[^0-9]", "", str(self.level.value))) if str(self.level.value).strip() else 1
+        except Exception:
+            lvl = 1
+        settings = await calc_get_settings(interaction.guild_id)
+        url = f"https://www.dododex.com/taming/{slug}" if slug else "https://www.dododex.com/"
+
+        desc_lines = [
+            f"**Creature:** {creature_name}",
+            f"**Wild Level:** {lvl}",
+            f"**Your Server Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**, SP Settings **{'ON' if settings.use_single_player_settings else 'OFF'}**",
+        ]
+        if str(self.food.value).strip():
+            desc_lines.append(f"**Food preference:** {str(self.food.value).strip()}")
+        if str(self.notes.value).strip():
+            desc_lines.append(f"**Notes:** {str(self.notes.value).strip()}")
+        desc_lines.append("\nOpen the Dododex link and set the same multipliers + level for exact food, narcotics, and time.")
+        e = discord.Embed(title="🧮 Tame Calculation", description="\n".join(desc_lines), color=0x3498DB)
+        e.add_field(name="Dododex", value=url, inline=False)
+        e.timestamp = datetime.utcnow()
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+class TameCalculatorView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Calculate", style=discord.ButtonStyle.success, custom_id="tame_calc:calculate")
+    async def calculate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_TameCalcModal())
+
+async def ensure_tame_calculator_panel(guild: discord.Guild) -> None:
+    global _TAME_CALC_MESSAGE_ID_RUNTIME
+    ch = await _resolve_text_channel(guild, TAME_CALC_CHANNEL_ID, "tame-calculator")
+    if not ch:
+        return
+
+    settings = await calc_get_settings(guild.id)
+    msg_id = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=str(ch.id),
+        message_id_runtime_name="_TAME_CALC_MESSAGE_ID_RUNTIME",
+        embed=_build_tame_calc_embed(guild, settings),
+        view=TameCalculatorView(),
+        pin=False,
+        expected_embed_title="🦖 Democracy Ark — Tame Calculator",
+    )
+    if msg_id and msg_id != _TAME_CALC_MESSAGE_ID_RUNTIME:
+        _TAME_CALC_MESSAGE_ID_RUNTIME = msg_id
+        print(f"[CALC] New TAME_CALC_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
+
+async def ensure_calc_settings_panel(guild: discord.Guild) -> None:
+    global _CALC_SETTINGS_MESSAGE_ID_RUNTIME
+    ch = await _resolve_text_channel(guild, CALC_SETTINGS_CHANNEL_ID, "calc-settings")
+    if not ch:
+        return
+
+    settings = await calc_get_settings(guild.id)
+    msg_id = await _ensure_panel_message(
+        guild=guild,
+        channel_id_str=str(ch.id),
+        message_id_runtime_name="_CALC_SETTINGS_MESSAGE_ID_RUNTIME",
+        embed=_build_calc_settings_embed(guild, settings),
+        view=CalcSettingsView(),
+        pin=False,
+        expected_embed_title="⚙️ Democracy Bot — Calculator Settings (Staff)",
+    )
+    if msg_id and msg_id != _CALC_SETTINGS_MESSAGE_ID_RUNTIME:
+        _CALC_SETTINGS_MESSAGE_ID_RUNTIME = msg_id
+        print(f"[CALC] New CALC_SETTINGS_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
+
 # -----------------------
 # ✅ NEW: Helpers — enforce specific channels for commands
 # -----------------------
@@ -3637,6 +3929,8 @@ async def on_ready():
             bot.add_view(GetRoleView())
             bot.add_view(SelfRolesView())
             bot.add_view(RoleManagerView())
+            bot.add_view(TameCalculatorView())
+            bot.add_view(CalcSettingsView())
             VIEWS_REGISTERED = True
             print("UI: persistent views registered", flush=True)
         except Exception:
@@ -3658,6 +3952,8 @@ async def on_ready():
             ("get_role_panel", ensure_get_role_panel),
             ("self_roles_panel", ensure_self_roles_panel),
             ("role_manager_panel", ensure_role_manager_panel),
+            ("tame_calculator_panel", ensure_tame_calculator_panel),
+            ("calc_settings_panel", ensure_calc_settings_panel),
         ]:
             try:
                 await fn(g)
