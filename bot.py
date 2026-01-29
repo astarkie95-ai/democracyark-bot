@@ -119,17 +119,6 @@ NITRADO_STATUS_POLL_SECONDS = os.getenv("NITRADO_STATUS_POLL_SECONDS", "60").str
 OWNERS_ROLE_ID_ENV = os.getenv("OWNERS_ROLE_ID", "").strip()
 OWNERS_ROLE_ID = int(OWNERS_ROLE_ID_ENV) if OWNERS_ROLE_ID_ENV.isdigit() else 1461514415559147725
 
-# Admin/Moderator roles (used for visibility/permissions in module panels)
-ADMIN_ROLE_ID_ENV = os.getenv("ADMIN_ROLE_ID", "").strip()
-ADMIN_ROLE_ID = int(ADMIN_ROLE_ID_ENV) if ADMIN_ROLE_ID_ENV.isdigit() else 1461514871396106404
-MODERATOR_ROLE_ID_ENV = os.getenv("MODERATOR_ROLE_ID", "").strip()
-MODERATOR_ROLE_ID = int(MODERATOR_ROLE_ID_ENV) if MODERATOR_ROLE_ID_ENV.isdigit() else 1461515030800629915
-
-# ✅ NEW: Starter Kit Admin module panel (keep admin-only tools out of public channels)
-STARTER_ADMIN_CHANNEL_ID = os.getenv("STARTER_ADMIN_CHANNEL_ID", "").strip()  # optional; defaults to SERVER_CONTROL_CHANNEL_ID if set
-STARTER_ADMIN_MESSAGE_ID = os.getenv("STARTER_ADMIN_MESSAGE_ID", "").strip()  # optional (panel message id to edit)
-STARTER_ADMIN_PIN = (os.getenv("STARTER_ADMIN_PIN", "1").strip().lower() in ("1", "true", "yes", "on"))
-
 DEFAULT_WELCOME_MESSAGE = (
     "Welcome to Democracy Ark, {mention}! Please read the rules and treat others with respect."
 )
@@ -200,7 +189,6 @@ class DemocracyBot(commands.Bot):
             # ✅ Server control panel: register persistent view for 24/7 buttons
             self.add_view(PersistentServerControlView())
             self.add_view(StarterKitPanelView())
-            self.add_view(StarterKitAdminPanelView())
             self.add_view(PersistentPollPanelView())
             print("TICKETS: persistent views registered", flush=True)
         except Exception:
@@ -595,32 +583,6 @@ def is_admin(interaction: discord.Interaction) -> bool:
         return p.administrator or p.manage_guild or p.manage_channels
     return False
 
-def is_owner_or_admin(interaction: discord.Interaction) -> bool:
-    """Owners/Admins only (role-based). Falls back to guild admin perms."""
-    if not interaction.guild or not interaction.user:
-        return False
-    if not isinstance(interaction.user, discord.Member):
-        return False
-    member: discord.Member = interaction.user
-    role_ids = {r.id for r in getattr(member, "roles", [])}
-    if OWNERS_ROLE_ID in role_ids or ADMIN_ROLE_ID in role_ids:
-        return True
-    # fallback: true server admins still count
-    p = member.guild_permissions
-    return bool(p.administrator)
-
-def _find_text_channel_id_by_name(guild: discord.Guild, name: str) -> int:
-    name = (name or "").strip().lower().lstrip("#")
-    if not name:
-        return 0
-    for ch in getattr(guild, "text_channels", []):
-        try:
-            if ch and ch.name.lower() == name:
-                return int(ch.id)
-        except Exception:
-            continue
-    return 0
-
 def _parse_id_set(csv_ids: str) -> Set[int]:
     out: Set[int] = set()
     for part in (csv_ids or "").split(","):
@@ -961,13 +923,11 @@ async def _get_text_channel(guild: discord.Guild, channel_id_str: str) -> Option
     except Exception:
         return None
 
-
 async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
-    """Fetch gameserver status via Nitrado API.
-
+    """
+    Fetch gameserver status via Nitrado API.
     Returns: (ok, payload)
-    Payload keys used by the status module:
-      status, hostname, game, map, ip, port, players, slots, provider
+    Payload fields: status, hostname, game, map, ip, port, players, slots
     """
     if not NITRADO_TOKEN or not _is_digit_id(NITRADO_SERVICE_ID):
         return False, {"error": "Nitrado not configured (NITRADO_TOKEN / NITRADO_SERVICE_ID)."}
@@ -977,142 +937,177 @@ async def nitrado_status_call() -> Tuple[bool, Dict[str, Any]]:
 
     def _to_int(x):
         try:
+            if x is None:
+                return None
             return int(x)
         except Exception:
             return None
 
-    def _pick(d: Dict[str, Any], keys: List[str]) -> Any:
-        for k in keys:
-            if k in d and d.get(k) not in (None, "", []):
-                return d.get(k)
+    def _to_str(x):
+        try:
+            if x is None:
+                return None
+            s = str(x).strip()
+            return s or None
+        except Exception:
+            return None
+
+    def _walk(obj):
+        # yields (key, value) for dicts recursively
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                yield k, v
+                yield from _walk(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                yield from _walk(it)
+
+    def _deep_get_first(obj, keys):
+        keys_l = {k.lower() for k in keys}
+        for k, v in _walk(obj):
+            try:
+                if str(k).lower() in keys_l:
+                    return v
+            except Exception:
+                continue
         return None
 
-    def _iter_dicts(obj: Any):
-        """Yield all dicts inside obj (depth-first)."""
-        if isinstance(obj, dict):
-            yield obj
-            for v in obj.values():
-                yield from _iter_dicts(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                yield from _iter_dicts(item)
+    def _deep_get_dict(obj, key):
+        key_l = str(key).lower()
+        for k, v in _walk(obj):
+            try:
+                if str(k).lower() == key_l and isinstance(v, dict):
+                    return v
+            except Exception:
+                continue
+        return None
 
-    def _score_gameserver(d: Dict[str, Any]) -> int:
+    def _normalize_candidate(item):
+        # Nitrado sometimes wraps each entry
+        if isinstance(item, dict) and isinstance(item.get("gameserver"), dict):
+            return item["gameserver"]
+        if isinstance(item, dict) and isinstance(item.get("game_server"), dict):
+            return item["game_server"]
+        if isinstance(item, dict):
+            return item
+        return {}
+
+    def _candidate_score(gs: dict) -> int:
         score = 0
-        if not isinstance(d, dict):
+        if not isinstance(gs, dict):
             return score
-
-        # Strong signal: a query dict that contains map/players
-        q = d.get("query")
-        if isinstance(q, dict):
-            if any(k in q for k in ("map", "map_name", "mapname", "player_current", "player_max", "players", "maxplayers")):
-                score += 6
-            score += 2  # has query at all
-
-        # Common essentials
-        if "ip" in d and "port" in d:
-            score += 4
-        if "status" in d:
-            score += 2
-
-        # Nice-to-have fields
-        for k in ("hostname", "name", "server_name", "game", "game_short", "game_name", "map", "map_name"):
-            if k in d:
-                score += 1
-
+        query = gs.get("query") if isinstance(gs.get("query"), dict) else _deep_get_dict(gs, "query") or {}
+        # Prefer candidates with live query numbers
+        live_players = _deep_get_first(gs, ["player_current", "players", "players_current", "players_online", "current_players"])
+        live_map = _deep_get_first(gs, ["map", "map_name", "current_map"])
+        if _to_int(live_players) is not None:
+            score += 100
+        if _to_str(live_map):
+            score += 50
+        if isinstance(query, dict) and query:
+            score += 10
+        if _to_str(gs.get("status")):
+            score += 5
+        if _to_str(gs.get("ip")) or _to_str(_deep_get_first(gs, ["ip", "host"])):
+            score += 3
+        if _to_int(gs.get("port")) or _to_int(_deep_get_first(gs, ["port", "game_port"])):
+            score += 3
         return score
 
-    def _deep_find_gameserver(obj: Any) -> Dict[str, Any]:
-        """Find the most 'gameserver-like' dict in a nested Nitrado response."""
-        best: Dict[str, Any] = {}
-        best_score = -1
-
-        def _walk(o: Any):
-            nonlocal best, best_score
-            if isinstance(o, dict):
-                for key in ("gameserver", "game_server", "gameservers", "gameServers", "servers"):
-                    if key in o:
-                        _walk(o.get(key))
-
-                s = _score_gameserver(o)
-                if s > best_score:
-                    best, best_score = o, s
-
-                for v in o.values():
-                    _walk(v)
-            elif isinstance(o, list):
-                for it in o:
-                    _walk(it)
-
-        _walk(obj)
-        return best if isinstance(best, dict) else {}
-
     try:
-        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as session:
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as session:
             async with session.get(url) as resp:
                 data = await resp.json(content_type=None)
 
-        # Defensive extraction across different Nitrado response shapes
-        root = data.get("data") if isinstance(data, dict) else data
-        gs = _deep_find_gameserver(root) or {}
+        # Collect candidate gameserver dicts (Nitrado response can vary)
+        candidates = []
+        if isinstance(data, dict):
+            data_block = data.get("data")
+            if isinstance(data_block, dict):
+                if isinstance(data_block.get("gameservers"), list):
+                    candidates.extend([_normalize_candidate(it) for it in data_block["gameservers"]])
+                if isinstance(data_block.get("gameserver"), dict):
+                    candidates.append(data_block["gameserver"])
+                if isinstance(data_block.get("game_server"), dict):
+                    candidates.append(data_block["game_server"])
+                # Sometimes the gameserver dict is directly the data block
+                candidates.append(data_block)
+            elif isinstance(data_block, list):
+                candidates.extend([_normalize_candidate(it) for it in data_block])
+            else:
+                # Sometimes data itself is the gameserver dict
+                candidates.append(data)
 
-        # Query info (map/players/etc) is sometimes nested inconsistently.
-        query = gs.get("query") if isinstance(gs, dict) else None
+        # Pick best candidate (prefer one that contains live query info)
+        gs = {}
+        if candidates:
+            gs = max((c for c in candidates if isinstance(c, dict)), key=_candidate_score, default={})
+        if not isinstance(gs, dict):
+            gs = {}
+
+        # Pull 'query' dict if present anywhere
+        query = gs.get("query") if isinstance(gs.get("query"), dict) else _deep_get_dict(gs, "query") or {}
         if not isinstance(query, dict):
             query = {}
 
-        # If query is still empty, try to locate a likely query dict within the gameserver payload.
-        if isinstance(gs, dict) and (not query):
-            best_q = None
-            best_q_score = -1
-            for d in _iter_dicts(gs):
-                if not isinstance(d, dict):
-                    continue
-                q_score = 0
-                if any(k in d for k in ("map", "map_name", "mapname", "level", "world")):
-                    q_score += 2
-                if any(k in d for k in ("player_current", "players_current", "player_max", "players_max", "players", "players_online", "current_players", "numplayers", "maxplayers", "slots")):
-                    q_score += 3
-                if any(k in d for k in ("ip", "port")):
-                    q_score += 1
-                if q_score > best_q_score:
-                    best_q = d
-                    best_q_score = q_score
-            if isinstance(best_q, dict) and best_q_score >= 3:
-                query = best_q
+        # Hostname can be in multiple places
+        hostname = (
+            gs.get("hostname")
+            or query.get("hostname")
+            or _deep_get_first(gs, ["hostname", "host_name"])
+            or _deep_get_first(gs, ["name"])
+        )
+        # Settings hostname (very common in Nitrado)
+        settings_general = _deep_get_dict(gs, "general") or {}
+        if isinstance(settings_general, dict):
+            hostname = hostname or settings_general.get("hostname")
 
-        status_raw = str(gs.get("status") or query.get("status") or "unknown").lower().strip()
+        game = gs.get("game") or gs.get("game_short") or query.get("game") or _deep_get_first(gs, ["game", "game_short", "game_id"])
+        map_name = (
+            gs.get("map")
+            or query.get("map")
+            or _deep_get_first(gs, ["map", "map_name", "current_map"])
+            or _deep_get_first(gs, ["level_name"])
+        )
 
-        hostname = _pick(gs, ["hostname", "server_name", "name"]) or _pick(query, ["hostname", "server_name", "name"])
-        # Extra Nitrado shapes: settings.general.hostname
-        if not hostname and isinstance(gs, dict):
-            settings = gs.get("settings")
-            if isinstance(settings, dict):
-                general = settings.get("general") or settings.get("General") or settings.get("general_settings")
-                if isinstance(general, dict):
-                    hostname = _pick(general, ["hostname", "server_name", "name"])
-        game = _pick(gs, ["game", "game_short", "game_name"]) or _pick(query, ["game", "game_short", "game_name"])
-        map_name = _pick(gs, ["map", "map_name", "mapname", "level", "world"]) or _pick(query, ["map", "map_name", "mapname", "level", "world"])
-        ip = _pick(gs, ["ip", "host", "address"]) or _pick(query, ["ip", "host", "address"])
-        port = _pick(gs, ["port", "gameport", "port_game"]) or _pick(query, ["port", "gameport", "port_game", "query_port"])
+        ip = gs.get("ip") or query.get("ip") or _deep_get_first(gs, ["ip", "host"])
+        port = gs.get("port") or query.get("port") or _deep_get_first(gs, ["port", "game_port"])
 
-        players = _pick(query, ["player_current", "players_current", "players", "players_online", "current_players", "numplayers", "playerCount", "online", "player_online"])
-        slots = _pick(query, ["player_max", "players_max", "maxplayers", "maxPlayers", "playerLimit", "slots", "capacity", "player_slots"])
+        # Live players / slots keys vary a lot between products
+        players_raw = (
+            query.get("player_current")
+            or query.get("players")
+            or query.get("players_current")
+            or query.get("players_online")
+            or gs.get("player_current")
+            or gs.get("players")
+            or _deep_get_first(gs, ["player_current", "players", "players_current", "players_online", "current_players"])
+        )
+        slots_raw = (
+            query.get("player_max")
+            or query.get("slots")
+            or query.get("max_players")
+            or gs.get("player_max")
+            or gs.get("slots")
+            or _deep_get_first(gs, ["player_max", "slots", "max_players", "players_max", "capacity"])
+        )
+
+        status_raw = _to_str(gs.get("status")) or "unknown"
+        status_raw = status_raw.lower()
 
         payload = {
-            "provider": "Nitrado",
             "status": status_raw,
-            "hostname": str(hostname) if hostname else None,
-            "game": str(game) if game else None,
-            "map": str(map_name) if map_name else None,
-            "ip": str(ip) if ip else None,
+            "hostname": _to_str(hostname),
+            "game": _to_str(game),
+            "map": _to_str(map_name),
+            "ip": _to_str(ip),
             "port": _to_int(port),
-            "players": _to_int(players),
-            "slots": _to_int(slots),
+            "players": _to_int(players_raw),
+            "slots": _to_int(slots_raw),
         }
         return True, payload
     except Exception as e:
-        return False, {"error": repr(e), "provider": "Nitrado"}
+        return False, {"error": repr(e)}
 
 
 def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
@@ -1122,7 +1117,7 @@ def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
     module = (
         "```ansi\n"
         "⟦ DEMOCRACY ARK : LIVE SERVER MODULE ⟧\n"
-        f"Status   : {badge}\n"f"Provider : {payload.get('provider') or '—'}\n"
+        f"Status   : {badge}\n"
         f"Host     : {payload.get('hostname') or '—'}\n"
         f"Game     : {payload.get('game') or '—'}\n"
         f"Map      : {payload.get('map') or '—'}\n"
@@ -1676,7 +1671,6 @@ async def _announce_server_action(guild: discord.Guild, action: str, message: st
 # =====================================================================
 
 _STARTER_PANEL_MESSAGE_ID_RUNTIME: int = int(STARTER_PANEL_MESSAGE_ID) if _is_digit_id(STARTER_PANEL_MESSAGE_ID) else 0
-_STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME: int = int(STARTER_ADMIN_MESSAGE_ID) if _is_digit_id(STARTER_ADMIN_MESSAGE_ID) else 0
 _POLL_PANEL_MESSAGE_ID_RUNTIME: int = int(POLL_PANEL_MESSAGE_ID) if _is_digit_id(POLL_PANEL_MESSAGE_ID) else 0
 
 def _module_box(header: str, lines: List[str]) -> str:
@@ -1701,35 +1695,14 @@ def _poll_vote_channel_id() -> str:
     """Where polls are actually posted and voted on (defaults to VOTE_CHANNEL_ID)."""
     return VOTE_CHANNEL_ID if _is_digit_id(VOTE_CHANNEL_ID) else _poll_panel_channel_id()
 
-def _poll_panel_channel_id_for_guild(guild: discord.Guild) -> str:
-    """Resolve where the Poll MODULE PANEL message lives.
-
-    Priority:
-    1) POLL_PANEL_CHANNEL_ID env (explicit)
-    2) A channel named 'create-poll' (recommended staff channel)
-    3) VOTE_CHANNEL_ID fallback
-    """
-    if _is_digit_id(POLL_PANEL_CHANNEL_ID):
-        return POLL_PANEL_CHANNEL_ID
-    # Try by name so you don't have to set an env var
-    try:
-        found = _find_text_channel_id_by_name(guild, "create-poll")
-        if found:
-            return str(found)
-    except Exception:
-        pass
-    return VOTE_CHANNEL_ID
-
-
-
 def _build_starter_panel_embed() -> discord.Embed:
     lines = [
         "🎁 Claim your free ingame starter kit",
         "",
-        f"Available vaults : {len(PINS_POOL)}",
+        f"Available kits : {len(PINS_POOL)}",
         "One per person : enabled",
         "",
-        "Press **Claim Starter Kit** to receive your vault PIN privately.",
+        "Press **Claim Starter Kit** to receive your box + PIN privately.",
     ]
     e = discord.Embed(
         title="🎁 Democracy Bot — Starter Kit Module",
@@ -1741,7 +1714,7 @@ def _build_starter_panel_embed() -> discord.Embed:
     return e
 
 class StarterKitPanelView(discord.ui.View):
-    """Persistent view for the public Starter Kit module panel."""
+    """Persistent view for the Starter Kit module panel."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1750,9 +1723,9 @@ class StarterKitPanelView(discord.ui.View):
         if not interaction.user:
             return
 
-        # Enforce claim channel if configured; if not configured, panel itself controls where it's posted.
+        # Enforce claim channel if configured
         allowed_ch = _starter_panel_channel_id()
-        if _is_digit_id(allowed_ch) and (not _only_in_channel(interaction, allowed_ch)):
+        if not _only_in_channel(interaction, allowed_ch):
             await _wrong_channel(interaction, "#claim-starter-kit")
             return
 
@@ -1763,7 +1736,7 @@ class StarterKitPanelView(discord.ui.View):
             box, pin = CLAIMS[uid]
             try:
                 await interaction.response.send_message(
-                    f"✅ You already claimed a starter vault.\n**Your vault:** #{box}\n**Your PIN:** `{pin}`",
+                    f"✅ You already claimed a kit.\n**Your box:** #{box}\n**Your PIN:** `{pin}`",
                     ephemeral=True,
                 )
             except Exception:
@@ -1773,14 +1746,14 @@ class StarterKitPanelView(discord.ui.View):
         if not PINS_POOL:
             try:
                 await interaction.response.send_message(
-                    "❌ No starter vaults available right now.\nAsk an admin to restock.",
+                    "❌ No starter kits available right now.\nAsk an admin to restock.",
                     ephemeral=True,
                 )
             except Exception:
                 pass
             return
 
-        # Pick lowest vault number available
+        # Pick lowest box number available
         box = sorted(PINS_POOL.keys())[0]
         bp = PINS_POOL.pop(box)
 
@@ -1789,10 +1762,10 @@ class StarterKitPanelView(discord.ui.View):
         await save_claims_only()
 
         msg = (
-            f"🎁 Starter vault claimed!\n"
-            f"**Your vault:** #{bp.box}\n"
+            f"🎁 Starter kit claimed!\n"
+            f"**Your box:** #{bp.box}\n"
             f"**Your PIN:** `{bp.pin}`\n\n"
-            f"Go to the Community Hub and unlock **Vault #{bp.box}** with that PIN."
+            f"Go to the Community Hub and unlock **Box #{bp.box}** with that PIN."
         )
 
         # Ephemeral + DM fallback
@@ -1809,7 +1782,6 @@ class StarterKitPanelView(discord.ui.View):
         try:
             if interaction.guild:
                 await refresh_starter_panel(interaction.guild)
-                await refresh_starter_admin_panel(interaction.guild)
         except Exception:
             pass
 
@@ -1817,8 +1789,8 @@ class StarterKitPanelView(discord.ui.View):
     async def claim_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         await self._claim(interaction)
 
-    @discord.ui.button(label="My Vault", style=discord.ButtonStyle.secondary, custom_id="starterpanel_myvault")
-    async def myvault_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+    @discord.ui.button(label="My Kit", style=discord.ButtonStyle.secondary, custom_id="starterpanel_mykit")
+    async def mykit_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.user:
             return
         uid = interaction.user.id
@@ -1826,7 +1798,7 @@ class StarterKitPanelView(discord.ui.View):
             box, pin = CLAIMS[uid]
             try:
                 await interaction.response.send_message(
-                    f"✅ Your starter vault:\n**Vault:** #{box}\n**PIN:** `{pin}`",
+                    f"✅ Your kit:\n**Box:** #{box}\n**PIN:** `{pin}`",
                     ephemeral=True,
                 )
             except Exception:
@@ -1834,175 +1806,24 @@ class StarterKitPanelView(discord.ui.View):
         else:
             try:
                 await interaction.response.send_message(
-                    "ℹ️ You haven't claimed a starter vault yet.\nPress **Claim Starter Kit**.",
+                    "ℹ️ You haven't claimed a starter kit yet.\nPress **Claim Starter Kit**.",
                     ephemeral=True,
                 )
             except Exception:
                 pass
 
-
-def _starter_admin_channel_id() -> str:
-    # Prefer explicit admin channel, otherwise reuse server-control-panel channel if configured.
-    if _is_digit_id(STARTER_ADMIN_CHANNEL_ID):
-        return STARTER_ADMIN_CHANNEL_ID
-    if _is_digit_id(SERVER_CONTROL_CHANNEL_ID):
-        return SERVER_CONTROL_CHANNEL_ID
-    return ""
-
-
-def _build_starter_admin_panel_embed() -> discord.Embed:
-    lines = [
-        "Admin tools for managing the starter vault pool.",
-        "",
-        f"Available vaults : {len(PINS_POOL)}",
-        f"Claimed vaults   : {len(CLAIMS)}",
-        f"Storage          : {'Database' if DB_POOL else 'CSV files'}",
-        "",
-        "Use the buttons below to add or delete vaults from the pool.",
-    ]
-    e = discord.Embed(
-        title="🗄️ Democracy Bot — Starter Vault Admin",
-        description=_module_box("STARTER VAULT ADMIN", lines),
-        color=0xE67E22,
-    )
-    e.set_footer(text="Tip: Keep this panel in an Owners/Admin-only channel.")
-    e.timestamp = datetime.utcnow()
-    return e
-
-
-async def starter_add_vault(vault_number: int, pin: str):
-    try:
-        vault = int(vault_number)
-    except Exception:
-        return False, "Vault number must be a number."
-    pin = (pin or "").strip()
-    if vault <= 0:
-        return False, "Vault number must be 1 or higher."
-    if not pin:
-        return False, "PIN cannot be empty."
-
-    if vault in PINS_POOL:
-        return False, f"Vault #{vault} is already in the pool."
-    for _, (b, _) in CLAIMS.items():
-        if int(b) == vault:
-            return False, f"Vault #{vault} is already claimed."
-
-    PINS_POOL[vault] = BoxPin(box=vault, pin=pin)
-    await save_pool_state()
-    return True, f"✅ Added Vault #{vault} to the pool."
-
-
-
-def _format_starter_claims_preview(guild: Optional[discord.Guild] = None, limit: int = 25) -> str:
-    """Return a short, readable preview list of claims."""
-    if not CLAIMS:
-        return "No one has claimed a starter vault yet."
-    lines = []
-    i = 0
-    for uid, (vault, pin) in CLAIMS.items():
-        i += 1
-        if i > limit:
-            break
-        name = f"<@{uid}>"
-        # If we can resolve a member name, use it (nice, but optional)
-        if guild:
+    @discord.ui.button(label="Pool Count (Admin)", style=discord.ButtonStyle.success, custom_id="starterpanel_poolcount")
+    async def poolcount_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not is_admin(interaction):
             try:
-                member = guild.get_member(int(uid))
-                if member:
-                    name = f"{member.display_name} (<@{uid}>)"
+                await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             except Exception:
                 pass
-        lines.append(f"{i}. {name} — Vault #{vault}")
-    more = ""
-    if len(CLAIMS) > limit:
-        more = f"\n…plus {len(CLAIMS) - limit} more."
-    return "\n".join(lines) + more
-
-async def starter_delete_vault(vault_number: int):
-    try:
-        vault = int(vault_number)
-    except Exception:
-        return False, "Vault number must be a number."
-    if vault <= 0:
-        return False, "Vault number must be 1 or higher."
-
-    if vault not in PINS_POOL:
-        return False, f"Vault #{vault} is not currently in the pool (it may be claimed or not exist)."
-
-    PINS_POOL.pop(vault, None)
-    await save_pool_state()
-    return True, f"✅ Deleted Vault #{vault} from the pool."
-
-
-class StarterAddVaultModal(discord.ui.Modal, title="Add Starter Vault"):
-    vault_number = discord.ui.TextInput(label="Vault number", placeholder="e.g. 12", required=True, max_length=10)
-    vault_pin = discord.ui.TextInput(label="Vault PIN", placeholder="e.g. 7391", required=True, max_length=32)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_owner_or_admin(interaction):
-            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
             return
-        ok, msg = await starter_add_vault(str(self.vault_number.value).strip(), str(self.vault_pin.value).strip())
-        await interaction.response.send_message(msg, ephemeral=True)
         try:
-            if interaction.guild:
-                await refresh_starter_panel(interaction.guild)
-                await refresh_starter_admin_panel(interaction.guild)
+            await interaction.response.send_message(pool_counts(), ephemeral=True)
         except Exception:
             pass
-
-
-class StarterDeleteVaultModal(discord.ui.Modal, title="Delete Starter Vault"):
-    vault_number = discord.ui.TextInput(label="Vault number", placeholder="e.g. 12", required=True, max_length=10)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_owner_or_admin(interaction):
-            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
-            return
-        ok, msg = await starter_delete_vault(str(self.vault_number.value).strip())
-        await interaction.response.send_message(msg, ephemeral=True)
-        try:
-            if interaction.guild:
-                await refresh_starter_panel(interaction.guild)
-                await refresh_starter_admin_panel(interaction.guild)
-        except Exception:
-            pass
-
-
-class StarterKitAdminPanelView(discord.ui.View):
-    """Persistent view for the Starter Vault Admin panel (keep in admin-only channel)."""
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Add Vault", style=discord.ButtonStyle.success, custom_id="starteradmin_addvault")
-    async def addvault_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not is_owner_or_admin(interaction):
-            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
-            return
-        await interaction.response.send_modal(StarterAddVaultModal())
-
-    @discord.ui.button(label="Delete Vault", style=discord.ButtonStyle.danger, custom_id="starteradmin_deletevault")
-    async def deletevault_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not is_owner_or_admin(interaction):
-            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
-            return
-        await interaction.response.send_modal(StarterDeleteVaultModal())
-
-
-    @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starteradmin_viewclaims")
-    async def viewclaims_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not is_owner_or_admin(interaction):
-            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
-            return
-        preview = _format_starter_claims_preview(interaction.guild, limit=30)
-        await interaction.response.send_message(f"**Starter vault claims ({len(CLAIMS)} total):**\n{preview}", ephemeral=True)
-
-    @discord.ui.button(label="Pool Count", style=discord.ButtonStyle.secondary, custom_id="starteradmin_poolcount")
-    async def poolcount_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not is_owner_or_admin(interaction):
-            await interaction.response.send_message("❌ Owners/Admins only.", ephemeral=True)
-            return
-        await interaction.response.send_message(pool_counts(), ephemeral=True)
 
 async def _ensure_panel_message(
     guild: discord.Guild,
@@ -2011,22 +1832,12 @@ async def _ensure_panel_message(
     embed: discord.Embed,
     view: discord.ui.View,
     pin: bool = False,
-    expected_embed_title: Optional[str] = None,
-    scan_limit: int = 50,
 ) -> Optional[int]:
-    """Generic helper used by module panels.
-
-    Reuse logic (prevents duplicates after redeploy/restart):
-    1) If a stored message id exists (runtime/env), fetch + edit.
-    2) Else, scan pinned messages (if pin=True) and recent history for a message from the bot whose
-       first embed title matches expected_embed_title, then edit in place.
-    3) Else, send a new message, optionally pin, and return its id.
-    """
+    """Generic helper used by module panels."""
     ch = await _get_text_channel(guild, channel_id_str)
     if not ch:
         return None
 
-    # 1) Try explicit stored id first
     current_id = globals().get(message_id_runtime_name, 0) or 0
     if current_id:
         try:
@@ -2036,47 +1847,6 @@ async def _ensure_panel_message(
         except Exception:
             pass
 
-    # 2) Scan for an existing panel (prevents duplicate panels on redeploy)
-    if expected_embed_title:
-        try:
-            # Prefer pinned messages if we intend to pin
-            if pin:
-                try:
-                    pinned = await ch.pins()
-                except Exception:
-                    pinned = []
-                for pm in pinned:
-                    try:
-                        if pm.author and pm.author.id == guild.me.id and pm.embeds:
-                            e0 = pm.embeds[0]
-                            if getattr(e0, "title", None) == expected_embed_title:
-                                await pm.edit(embed=embed, view=view)
-                                globals()[message_id_runtime_name] = int(pm.id)
-                                return int(pm.id)
-                    except Exception:
-                        continue
-
-            # Recent history scan
-            async for hm in ch.history(limit=max(10, min(int(scan_limit), 200))):
-                try:
-                    if hm.author and hm.author.id == guild.me.id and hm.embeds:
-                        e0 = hm.embeds[0]
-                        if getattr(e0, "title", None) == expected_embed_title:
-                            await hm.edit(embed=embed, view=view)
-                            globals()[message_id_runtime_name] = int(hm.id)
-                            # Optionally pin if requested
-                            if pin:
-                                try:
-                                    await hm.pin(reason="Democracy Bot: module panel")
-                                except Exception:
-                                    pass
-                            return int(hm.id)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    # 3) Create a new panel message
     try:
         msg = await ch.send(embed=embed, view=view)
         if pin:
@@ -2084,7 +1854,6 @@ async def _ensure_panel_message(
                 await msg.pin(reason="Democracy Bot: module panel")
             except Exception:
                 pass
-        globals()[message_id_runtime_name] = int(msg.id)
         return int(msg.id)
     except Exception:
         return None
@@ -2094,12 +1863,7 @@ async def ensure_starter_panel(guild: discord.Guild) -> None:
 
     ch_id = _starter_panel_channel_id()
     if not _is_digit_id(ch_id):
-        # Try by name in case you didn't set IDs
-        found = _find_text_channel_id_by_name(guild, "claim-starter-kit")
-        if found:
-            ch_id = str(found)
-        else:
-            return
+        return
 
     msg_id = await _ensure_panel_message(
         guild=guild,
@@ -2108,7 +1872,6 @@ async def ensure_starter_panel(guild: discord.Guild) -> None:
         embed=_build_starter_panel_embed(),
         view=StarterKitPanelView(),
         pin=STARTER_PANEL_PIN,
-        expected_embed_title="🎁 Democracy Bot — Starter Kit Module",
     )
     if msg_id and msg_id != _STARTER_PANEL_MESSAGE_ID_RUNTIME:
         _STARTER_PANEL_MESSAGE_ID_RUNTIME = msg_id
@@ -2333,7 +2096,7 @@ class PersistentPollPanelView(discord.ui.View):
 async def ensure_poll_panel(guild: discord.Guild) -> None:
     global _POLL_PANEL_MESSAGE_ID_RUNTIME
 
-    ch_id = _poll_panel_channel_id_for_guild(guild)
+    ch_id = _poll_panel_channel_id()
     if not _is_digit_id(ch_id):
         return
 
@@ -2345,59 +2108,16 @@ async def ensure_poll_panel(guild: discord.Guild) -> None:
         embed=_build_poll_panel_embed(active if active and not active.ended else None),
         view=PersistentPollPanelView(),
         pin=POLL_PANEL_PIN,
-        expected_embed_title="🗳️ Democracy Bot — Polls",
     )
     if msg_id and msg_id != _POLL_PANEL_MESSAGE_ID_RUNTIME:
         _POLL_PANEL_MESSAGE_ID_RUNTIME = msg_id
         print(f"[POLL] New POLL_PANEL_MESSAGE_ID = {msg_id} (save this in Railway Variables)", flush=True)
 
-
-async def refresh_starter_admin_panel(guild: discord.Guild) -> None:
-    """Update the Starter Vault Admin panel embed in-place."""
-    global _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME
-    if not _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME:
-        return
-    ch_id = _starter_admin_channel_id()
-    if not _is_digit_id(ch_id):
-        return
-    ch = await _get_text_channel(guild, ch_id)
-    if not ch:
-        return
-    try:
-        msg = await ch.fetch_message(int(_STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME))
-        await msg.edit(embed=_build_starter_admin_panel_embed(), view=StarterKitAdminPanelView())
-    except Exception:
-        pass
-
-async def ensure_starter_admin_panel(guild: discord.Guild) -> None:
-    """Ensure the Starter Vault Admin panel exists (recommended: keep in Owners/Admin-only channel)."""
-    global _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME
-
-    ch_id = _starter_admin_channel_id()
-    if not _is_digit_id(ch_id):
-        found = _find_text_channel_id_by_name(guild, "server-control-panel")
-        if found:
-            ch_id = str(found)
-        else:
-            return
-
-    msg_id = await _ensure_panel_message(
-        guild=guild,
-        channel_id_str=ch_id,
-        message_id_runtime_name="_STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME",
-        embed=_build_starter_admin_panel_embed(),
-        view=StarterKitAdminPanelView(),
-        pin=STARTER_ADMIN_PIN,
-        expected_embed_title="🗄️ Democracy Bot — Starter Vault Admin",
-    )
-    if msg_id and msg_id != _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME:
-        _STARTER_ADMIN_PANEL_MESSAGE_ID_RUNTIME = msg_id
-        print(f"[STARTER-ADMIN] New STARTER_ADMIN_MESSAGE_ID = {msg_id} (optional to save in Railway Variables)", flush=True)
 async def refresh_poll_panel(guild: discord.Guild, vote_channel_id: int) -> None:
     global _POLL_PANEL_MESSAGE_ID_RUNTIME
     if not _POLL_PANEL_MESSAGE_ID_RUNTIME:
         return
-    ch_id = _poll_panel_channel_id_for_guild(guild)
+    ch_id = _poll_panel_channel_id()
     ch = await _get_text_channel(guild, ch_id)
     if not ch:
         return
@@ -2535,7 +2255,7 @@ def append_reset_log(admin_id: int, box: int, user_id: int, pin: str, reason: st
         w.writerow([int(time.time()), admin_id, box, user_id, pin, reason])
 
 def pool_counts() -> str:
-    return f"Available starter vaults: **{len(PINS_POOL)}**"
+    return f"Available starter kits: **{len(PINS_POOL)}**"
 
 # -----------------------
 # ✅ NEW: persistence wrappers (DB preferred, CSV fallback)
@@ -2629,7 +2349,6 @@ async def on_ready():
             await ensure_server_control_panel(g)
             # ✅ NEW: ensure Starter Kit + Poll panels exist (no-command modules)
             await ensure_starter_panel(g)
-            await ensure_starter_admin_panel(g)
             await ensure_poll_panel(g)
     except Exception:
         print("MODULES: ensure panels failed:", traceback.format_exc(), flush=True)
@@ -2836,7 +2555,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
 
     if box in PINS_POOL:
         await interaction.response.send_message(
-            f"❌ Vault #{box} is already in the pool.\nPick another box number.",
+            f"❌ Box #{box} is already in the pool.\nPick another box number.",
             ephemeral=True
         )
         return
@@ -2845,7 +2564,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
     for uid, (claimed_box, _) in CLAIMS.items():
         if claimed_box == box:
             await interaction.response.send_message(
-                f"❌ Vault #{box} is currently claimed.\nUse `/resetbox {box}` if you want to put it back.",
+                f"❌ Box #{box} is currently claimed.\nUse `/resetbox {box}` if you want to put it back.",
                 ephemeral=True
             )
             return
@@ -2861,7 +2580,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
         pass
 
     await interaction.response.send_message(
-        f"✅ Added starter kit to pool.\n**Vault:** #{box}\n**PIN:** `{pin}`\n\n{pool_counts()}",
+        f"✅ Added starter kit to pool.\n**Box:** #{box}\n**PIN:** `{pin}`\n\n{pool_counts()}",
         ephemeral=True
     )
 
@@ -2949,7 +2668,7 @@ async def resetbox(interaction: discord.Interaction, box: int):
     # If already available, nothing to do
     if box in PINS_POOL:
         await interaction.response.send_message(
-            f"ℹ️ Vault #{box} is already in the pool.\n{pool_counts()}",
+            f"ℹ️ Box #{box} is already in the pool.\n{pool_counts()}",
             ephemeral=True
         )
         return
@@ -2966,7 +2685,7 @@ async def resetbox(interaction: discord.Interaction, box: int):
 
     if claimant_uid is None or claimant_pin is None:
         await interaction.response.send_message(
-            f"❌ I can’t find Vault #{box} in current claims or pool.\n"
+            f"❌ I can’t find Box #{box} in current claims or pool.\n"
             f"It may never have been claimed, or your claims file got wiped.",
             ephemeral=True
         )
@@ -3041,7 +2760,7 @@ async def claimstarter(interaction: discord.Interaction):
     if uid in CLAIMS:
         box, pin = CLAIMS[uid]
         await interaction.response.send_message(
-            f"✅ You already claimed a kit.\n**Your vault:** #{box}\n**Your PIN:** `{pin}`",
+            f"✅ You already claimed a kit.\n**Your box:** #{box}\n**Your PIN:** `{pin}`",
             ephemeral=True
         )
         return
@@ -3073,9 +2792,9 @@ async def claimstarter(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"🎁 Starter kit claimed!\n"
-        f"**Your vault:** #{bp.box}\n"
+        f"**Your box:** #{bp.box}\n"
         f"**Your PIN:** `{bp.pin}`\n\n"
-        f"Go to the Community Hub and unlock **Vault #{bp.box}** with that PIN.\n\n"
+        f"Go to the Community Hub and unlock **Box #{bp.box}** with that PIN.\n\n"
         f"{pool_counts()}",
         ephemeral=True
     )
