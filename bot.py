@@ -3962,6 +3962,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     # required affinity
     affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level - 1)
 
+    affinity_needed = affinity_needed / taming_speed
     # pick food
     food_key = _pick_food(c, food_pref) or ""
     foodname_disp = food_key
@@ -3992,7 +3993,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     wake_aff_mult = float(c.get("wakeAffinityMult") or 1.0) if non_violent else 1.0
     wake_food_mult = float(c.get("wakeFoodDeplMult") or 1.0) if non_violent else 1.0
 
-    food_affinity_eff = food_affinity * wake_aff_mult * taming_speed
+    food_affinity_eff = food_affinity * wake_aff_mult
     food_value_eff = food_value * wake_food_mult
 
     food_pieces = int(math.ceil(affinity_needed / food_affinity_eff))
@@ -4003,11 +4004,11 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     else:
         base = float(c.get("foodConsumptionBase") or 0.0)
         mult = float(c.get("foodConsumptionMult") or 0.0)
-        denom = base * mult * food_drain_mult
+        denom = base * mult
         if denom <= 0:
             seconds = 0
         else:
-            seconds = int(math.ceil(food_pieces * abs(food_value_eff) / denom))
+            seconds = int(math.ceil(food_pieces * abs(food_value_eff) / denom * food_drain_mult))
 
     # correction hacks used on wiki
     if c.get("resultCorrection") is not None:
