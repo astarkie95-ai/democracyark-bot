@@ -6,7 +6,6 @@ import io
 import re
 import random
 import math
-import sys
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -4615,26 +4614,32 @@ def _creature_letter_groups(keys: List[str]) -> Dict[str, List[str]]:
         groups[gk].sort(key=lambda x: x.lower())
     return dict(sorted(groups.items(), key=lambda kv: kv[0]))
 
-async def _ensure_calc_data(interaction: discord.Interaction) -> bool:
-    """Ensure taming + breeding datasets are loaded.
-
-    Important UX note:
-    - We only defer (which shows 'Bot is thinking…') when we actually need to load remote data.
-    - Once data is cached in memory, dropdown clicks should respond instantly without the thinking banner.
-    """
-    # Fast path: already loaded in memory
-    if _TAMING_CREATURES and _TAMING_FOOD and _BREEDING_DATA:
-        return True
-
-    # If we need to fetch, defer to avoid the 3s interaction timeout.
+async def _defer_calc_if_needed(interaction: discord.Interaction) -> None:
+    """Defer only when we might do slow I/O (prevents the 3s interaction timeout)."""
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception:
         pass
 
-    ok1 = await ensure_taming_data_loaded()
-    ok2 = await ensure_breeding_data_loaded()
+async def _ensure_tame_data(interaction: discord.Interaction) -> bool:
+    # Fast path: already loaded in memory
+    if _TAMING_CREATURES and _TAMING_FOOD:
+        return True
+    await _defer_calc_if_needed(interaction)
+    return bool(await ensure_taming_data_loaded())
+
+async def _ensure_breed_data(interaction: discord.Interaction) -> bool:
+    # Fast path: already loaded in memory
+    if _BREEDING_DATA:
+        return True
+    await _defer_calc_if_needed(interaction)
+    return bool(await ensure_breeding_data_loaded())
+
+# Backwards compatibility: some flows call this expecting both
+async def _ensure_calc_data(interaction: discord.Interaction) -> bool:
+    ok1 = await _ensure_tame_data(interaction)
+    ok2 = await _ensure_breed_data(interaction)
     return bool(ok1 and ok2)
 
 class _CreatureLetterSelect(discord.ui.Select):
@@ -4893,9 +4898,9 @@ class _ToggleTorporItemBtn(discord.ui.Button):
         await start_tame_calculator_flow(interaction, edit=True)
 
 async def start_tame_calculator_flow(interaction: discord.Interaction, edit: bool = False):
-    ok = await _ensure_calc_data(interaction)
+    ok = await _ensure_tame_data(interaction)
     if not ok:
-        msg = "⚠️ Calculator data isn’t loaded yet. Staff can press **Reload Data** on the panel."
+        msg = "⚠️ Taming data isn’t loaded yet. Staff can press **Reload Data** on the panel."
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
@@ -5105,9 +5110,9 @@ class _BreedingFlowView(discord.ui.View):
         await start_breeding_calculator_flow(interaction, edit=True)
 
 async def start_breeding_calculator_flow(interaction: discord.Interaction, edit: bool = False):
-    ok = await _ensure_calc_data(interaction)
+    ok = await _ensure_breed_data(interaction)
     if not ok:
-        msg = "⚠️ Calculator data isn’t loaded yet. Staff can press **Reload Data** on the panel."
+        msg = "⚠️ Breeding data isn’t loaded yet. Staff can press **Reload Data** on the panel."
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
