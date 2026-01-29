@@ -3885,7 +3885,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     food_drain_mult = max(0.1, float(settings.food_drain or 1.0))
 
     # required affinity
-    affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level)
+    affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level - 1)
 
     # pick food
     food_key = _pick_food(c, food_pref) or ""
@@ -3912,12 +3912,12 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     if food_affinity <= 0 or food_value == 0:
         raise RuntimeError("unsupported food for this creature")
 
-    # wiki module multiplies affinity by 4 (post-2020 change)
+    # Note: Dododex-style timing uses the raw affinity values (no extra x4 multiplier).
     non_violent = bool(c.get("nonViolentTame") == 1)
     wake_aff_mult = float(c.get("wakeAffinityMult") or 1.0) if non_violent else 1.0
     wake_food_mult = float(c.get("wakeFoodDeplMult") or 1.0) if non_violent else 1.0
 
-    food_affinity_eff = food_affinity * wake_aff_mult * 4.0 * taming_speed
+    food_affinity_eff = food_affinity * wake_aff_mult * taming_speed
     food_value_eff = food_value * wake_food_mult
 
     food_pieces = int(math.ceil(affinity_needed / food_affinity_eff))
@@ -4437,17 +4437,514 @@ class _BreedingCalcModal(discord.ui.Modal, title="Breeding Calculator"):
         e.set_footer(text="Times sourced from official breeding tables, adjusted by your server multipliers.")
         await _send(embed=e)
 
+
+# =====================================================================
+# ✅ NEW: Dropdown-first Calculator Flows (Dododex-style UX)
+# =====================================================================
+
+# Per-user ephemeral session state (in-memory; resets on restart)
+_CALC_SESSIONS: Dict[Tuple[int,int], Dict[str, Any]] = {}  # (guild_id, user_id) -> state dict
+
+def _calc_session_key(interaction: discord.Interaction) -> Tuple[int,int]:
+    gid = interaction.guild.id if interaction.guild else 0
+    uid = interaction.user.id if interaction.user else 0
+    return (gid, uid)
+
+def _get_session(interaction: discord.Interaction) -> Dict[str, Any]:
+    key = _calc_session_key(interaction)
+    st = _CALC_SESSIONS.get(key)
+    if not isinstance(st, dict):
+        st = {}
+        _CALC_SESSIONS[key] = st
+    return st
+
+def _clear_session(interaction: discord.Interaction) -> None:
+    key = _calc_session_key(interaction)
+    _CALC_SESSIONS.pop(key, None)
+
+def _creature_letter_groups(keys: List[str]) -> Dict[str, List[str]]:
+    groups: Dict[str, List[str]] = {}
+    for k in keys:
+        if not k:
+            continue
+        first = k[0].upper()
+        if not ('A' <= first <= 'Z'):
+            first = '#'
+        groups.setdefault(first, []).append(k)
+    for gk in groups:
+        groups[gk].sort(key=lambda x: x.lower())
+    return dict(sorted(groups.items(), key=lambda kv: kv[0]))
+
+async def _ensure_calc_data(interaction: discord.Interaction) -> bool:
+    # Make sure wiki data is ready; always defer to avoid timeouts.
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    ok1 = await ensure_taming_data_loaded()
+    ok2 = await ensure_breeding_data_loaded()
+    return bool(ok1 and ok2)
+
+class _CreatureLetterSelect(discord.ui.Select):
+    def __init__(self, letters: List[str]):
+        opts = []
+        for L in letters[:25]:
+            opts.append(discord.SelectOption(label=L, value=L))
+        super().__init__(placeholder="Choose a letter group…", min_values=1, max_values=1, options=opts, custom_id="calc:letter")
+
+    async def callback(self, interaction: discord.Interaction):
+        st = _get_session(interaction)
+        st["letter"] = self.values[0]
+        st.pop("creature", None)
+        await start_tame_calculator_flow(interaction, edit=True)
+
+class _CreatureSelect(discord.ui.Select):
+    def __init__(self, creatures: List[str]):
+        opts=[]
+        for k in creatures[:25]:
+            opts.append(discord.SelectOption(label=k, value=k))
+        super().__init__(placeholder="Choose a creature…", min_values=1, max_values=1, options=opts, custom_id="calc:creature")
+
+    async def callback(self, interaction: discord.Interaction):
+        st = _get_session(interaction)
+        st["creature"] = self.values[0]
+        await start_tame_calculator_flow(interaction, edit=True)
+
+class _FoodSelect(discord.ui.Select):
+    def __init__(self, foods: List[str]):
+        opts=[discord.SelectOption(label=f, value=f) for f in foods[:25]]
+        super().__init__(placeholder="Choose a food…", min_values=1, max_values=1, options=opts, custom_id="calc:food")
+
+    async def callback(self, interaction: discord.Interaction):
+        st=_get_session(interaction)
+        st["food"]=self.values[0]
+        await start_tame_calculator_flow(interaction, edit=True)
+
+class _WeaponSelect(discord.ui.Select):
+    def __init__(self):
+        weapons=[
+            ("Bow + Tranq Arrow","bow_arrow"),
+            ("Crossbow + Tranq Arrow","crossbow_arrow"),
+            ("Longneck + Tranq Dart","tranq_dart"),
+            ("Longneck + Shocking Dart","shocking_dart"),
+            ("Wooden Club (rough)","club"),
+        ]
+        opts=[discord.SelectOption(label=a, value=b) for a,b in weapons]
+        super().__init__(placeholder="Choose a KO method…", min_values=1, max_values=1, options=opts, custom_id="calc:weapon")
+
+    async def callback(self, interaction: discord.Interaction):
+        st=_get_session(interaction)
+        st["weapon"]=self.values[0]
+        await start_tame_calculator_flow(interaction, edit=True)
+
+class _LevelSelect(discord.ui.Select):
+    def __init__(self):
+        # common ASA cap is 150; include quick picks + custom modal button for others
+        levels=[5,25,50,75,100,120,135,150]
+        opts=[discord.SelectOption(label=str(l), value=str(l)) for l in levels]
+        super().__init__(placeholder="Choose wild level (quick)…", min_values=1, max_values=1, options=opts, custom_id="calc:level")
+
+    async def callback(self, interaction: discord.Interaction):
+        st=_get_session(interaction)
+        st["level"]=int(self.values[0])
+        await start_tame_calculator_flow(interaction, edit=True)
+
+class _PctSelect(discord.ui.Select):
+    def __init__(self):
+        pcts=[50,75,100,125,150,200,250,300]
+        opts=[discord.SelectOption(label=f"{p}%", value=str(p)) for p in pcts]
+        super().__init__(placeholder="Weapon damage %…", min_values=1, max_values=1, options=opts, custom_id="calc:wdmg")
+
+    async def callback(self, interaction: discord.Interaction):
+        st=_get_session(interaction)
+        st["weapon_dmg"]=float(self.values[0])
+        await start_tame_calculator_flow(interaction, edit=True)
+
+class _NarcoSelect(discord.ui.Select):
+    def __init__(self):
+        opts=[
+            discord.SelectOption(label="Narcotic", value="narcotic"),
+            discord.SelectOption(label="Bio Toxin", value="biotoxin"),
+            discord.SelectOption(label="None / Not needed", value="none"),
+        ]
+        super().__init__(placeholder="Torpor sustain item…", min_values=1, max_values=1, options=opts, custom_id="calc:narco")
+
+    async def callback(self, interaction: discord.Interaction):
+        st=_get_session(interaction)
+        st["narco"]=self.values[0]
+        await start_tame_calculator_flow(interaction, edit=True)
+
+class _TameFlowView(discord.ui.View):
+    def __init__(self, letter_select: Optional[_CreatureLetterSelect], creature_select: Optional[_CreatureSelect], food_select: Optional[_FoodSelect], include_results: bool):
+        super().__init__(timeout=600)
+        if letter_select:
+            self.add_item(letter_select)
+        if creature_select:
+            self.add_item(creature_select)
+        if food_select:
+            self.add_item(food_select)
+        self.add_item(_LevelSelect())
+        self.add_item(_WeaponSelect())
+        self.add_item(_PctSelect())
+        self.add_item(_NarcoSelect())
+
+    @discord.ui.button(label="Calculate", style=discord.ButtonStyle.success, custom_id="calc:go")
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await run_tame_calculation(interaction)
+
+    @discord.ui.button(label="Reset", style=discord.ButtonStyle.secondary, custom_id="calc:reset")
+    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _clear_session(interaction)
+        await start_tame_calculator_flow(interaction, edit=True)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="calc:close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _clear_session(interaction)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.edit_message(message_id=interaction.message.id, content="✅ Closed.", view=None, embed=None)
+            else:
+                await interaction.response.edit_message(content="✅ Closed.", view=None, embed=None)
+        except Exception:
+            pass
+
+async def start_tame_calculator_flow(interaction: discord.Interaction, edit: bool = False):
+    ok = await _ensure_calc_data(interaction)
+    if not ok:
+        msg = "⚠️ Calculator data isn’t loaded yet. Staff can press **Reload Data** on the panel."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    if interaction.guild:
+        settings = await calc_get_settings(interaction.guild.id)
+    else:
+        settings = CalcSettings()
+
+    st = _get_session(interaction)
+
+    creature_keys = sorted(list(_TAMING_CREATURES.keys()), key=lambda x: x.lower()) if _TAMING_CREATURES else []
+    groups = _creature_letter_groups(creature_keys)
+    letters = list(groups.keys())
+
+    letter = st.get("letter")
+    if letter not in groups:
+        letter = letters[0] if letters else None
+        if letter:
+            st["letter"] = letter
+
+    creature_list = groups.get(letter, []) if letter else []
+    creature = st.get("creature")
+    if creature not in creature_list:
+        creature = None
+        st.pop("creature", None)
+
+    # foods for selected creature
+    foods = []
+    if creature:
+        cdat = _TAMING_CREATURES.get(creature, {})
+        eats = cdat.get("eats") if isinstance(cdat, dict) else None
+        if isinstance(eats, list):
+            foods = [f for f in eats if isinstance(f, str)]
+            # prefer kibble first
+            if "Kibble" in foods:
+                foods = ["Kibble"] + [f for f in foods if f != "Kibble"]
+
+    # default food
+    if foods and st.get("food") not in foods:
+        st["food"] = foods[0]
+
+    summary_lines = [
+        f"**Taming Speed:** {settings.taming_speed}x",
+        f"**Food Drain:** {settings.food_drain}x",
+        "",
+        f"**Creature:** {st.get('creature','(pick above)')}",
+        f"**Level:** {st.get('level','(pick)')}",
+        f"**Food:** {st.get('food','(pick)')}",
+        f"**KO:** { _weapon_label(st.get('weapon','crossbow_arrow')) if st.get('weapon') else '(pick)'}",
+        f"**Weapon Dmg:** {st.get('weapon_dmg','(pick)') if st.get('weapon_dmg') else '(pick)'}",
+        f"**Torpor Item:** {st.get('narco','(pick)')}",
+        "",
+        "Press **Calculate** when ready.",
+    ]
+
+    embed = discord.Embed(
+        title="🧮 Tame Calculator (Dropdown Mode)",
+        description="\n".join(summary_lines),
+        color=0x2ECC71,
+    )
+    embed.set_footer(text="Tip: If you don’t see a creature, staff can press Reload Data on the main panel.")
+
+    letter_select = _CreatureLetterSelect(letters) if letters else None
+    creature_select = _CreatureSelect(creature_list) if creature_list else None
+    food_select = _FoodSelect(foods) if foods else None
+
+    view = _TameFlowView(letter_select, creature_select, food_select, include_results=False)
+
+    try:
+        if edit and interaction.message:
+            if interaction.response.is_done():
+                await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
+            else:
+                await interaction.response.edit_message(embed=embed, view=view)
+        else:
+            # always ephemeral
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    except Exception:
+        pass
+
+
+async def run_tame_calculation(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("⚠️ This needs a server context.", ephemeral=True)
+        return
+
+    st = _get_session(interaction)
+    creature = st.get("creature")
+    level = st.get("level")
+    food = st.get("food")
+    weapon = st.get("weapon") or "crossbow_arrow"
+    wdmg = float(st.get("weapon_dmg") or 100.0)
+    narco = st.get("narco") or "narcotic"
+
+    missing = []
+    if not creature: missing.append("Creature")
+    if not level: missing.append("Level")
+    if not food: missing.append("Food")
+    if not st.get("weapon_dmg"): missing.append("Weapon %")
+    if not st.get("narco"): missing.append("Torpor item")
+    if missing:
+        msg = "❌ Missing: " + ", ".join(missing)
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+
+    settings = await calc_get_settings(interaction.guild.id)
+
+    weapon_text = _weapon_label(weapon)
+    try:
+        res = _compute_taming(creature, int(level), settings, food, weapon_text, wdmg)
+
+        seconds = int(res.get("seconds") or 0)
+        food_pieces = int(res.get("food_pieces") or 0)
+        food_disp = res.get("food_display") or res.get("food_key") or "Food"
+        time_disp = _fmt_seconds(seconds) if seconds > 0 else "—"
+
+        torpor = res.get("torpor") or {}
+        ko_lines = []
+        narco_lines = []
+        if isinstance(torpor, dict):
+            shots = torpor.get("shots")
+            if shots:
+                ko_lines.append(f"• **{torpor.get('weapon_label','Weapon')}** @ **{torpor.get('weapon_damage_pct', wdmg)}%** → ~**{shots}** hits")
+            # narcotics
+            if (torpor.get("narcotics") or 0) > 0:
+                narco_lines.append(f"• Narcotic: **{int(torpor.get('narcotics'))}**")
+            if (torpor.get("bio_toxin") or 0) > 0:
+                narco_lines.append(f"• Bio Toxin: **{int(torpor.get('bio_toxin'))}**")
+
+        e = discord.Embed(
+            title=f"🦖 Tame Result — {creature} (Lv {level})",
+            color=0x2ECC71,
+        )
+        e.add_field(name="Total Tame Time", value=time_disp, inline=True)
+        e.add_field(name="Food Needed", value=f"**{food_pieces}x** {food_disp}", inline=True)
+
+        if ko_lines:
+            e.add_field(name="KO Estimate", value="\n".join(ko_lines), inline=False)
+
+        if narco_lines:
+            e.add_field(name="Torpor Sustain (estimate)", value="\n".join(narco_lines), inline=False)
+
+        e.add_field(
+            name="Assumptions",
+            value=(
+                f"• Taming Speed: **{settings.taming_speed}x**\n"
+                f"• Food Drain: **{settings.food_drain}x**\n"
+                f"• Weapon Damage: **{wdmg}%**\n"
+                "Note: Results are computed from ARK Wiki tables; if you use Single Player Settings or custom food drain, update staff settings."
+            ),
+            inline=False,
+        )
+
+        await interaction.followup.send(embed=e, ephemeral=True)
+    except Exception as ex:
+        await interaction.followup.send(f"⚠️ Calculation failed: {ex}", ephemeral=True)
+
+# Breeding flow (dropdown-first; creature selection reused)
+class _BreedingFlowView(discord.ui.View):
+    def __init__(self, letter_select: Optional[_CreatureLetterSelect], creature_select: Optional[_CreatureSelect]):
+        super().__init__(timeout=600)
+        if letter_select:
+            self.add_item(letter_select)
+        if creature_select:
+            self.add_item(creature_select)
+
+    @discord.ui.button(label="Calculate Breeding", style=discord.ButtonStyle.success, custom_id="breed:go")
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await run_breeding_calculation(interaction)
+
+    @discord.ui.button(label="Reset", style=discord.ButtonStyle.secondary, custom_id="breed:reset")
+    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _clear_session(interaction)
+        await start_breeding_calculator_flow(interaction, edit=True)
+
+async def start_breeding_calculator_flow(interaction: discord.Interaction, edit: bool = False):
+    ok = await _ensure_calc_data(interaction)
+    if not ok:
+        msg = "⚠️ Calculator data isn’t loaded yet. Staff can press **Reload Data** on the panel."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    st = _get_session(interaction)
+
+    creature_keys = sorted(list(_BREEDING_TABLES.keys()), key=lambda x: x.lower()) if _BREEDING_TABLES else []
+    groups = _creature_letter_groups(creature_keys)
+    letters = list(groups.keys())
+
+    letter = st.get("b_letter") or st.get("letter")
+    if letter not in groups:
+        letter = letters[0] if letters else None
+    if letter:
+        st["b_letter"] = letter
+
+    creature_list = groups.get(letter, []) if letter else []
+    creature = st.get("b_creature")
+    if creature not in creature_list:
+        creature = None
+        st.pop("b_creature", None)
+
+    summary = [
+        f"**Creature:** {creature or '(pick above)'}",
+        "",
+        "Press **Calculate Breeding** to get mating, incubation, maturation, and imprint schedule.",
+    ]
+    embed = discord.Embed(title="🥚 Breeding Calculator (Dropdown Mode)", description="\n".join(summary), color=0x3498DB)
+
+    # We reuse select classes but store into b_* keys
+    class _BLetter(_CreatureLetterSelect):
+        async def callback(self, interaction: discord.Interaction):
+            st=_get_session(interaction)
+            st["b_letter"]=self.values[0]
+            st.pop("b_creature", None)
+            await start_breeding_calculator_flow(interaction, edit=True)
+
+    class _BCreature(_CreatureSelect):
+        async def callback(self, interaction: discord.Interaction):
+            st=_get_session(interaction)
+            st["b_creature"]=self.values[0]
+            await start_breeding_calculator_flow(interaction, edit=True)
+
+    letter_select = _BLetter(letters) if letters else None
+    creature_select = _BCreature(creature_list) if creature_list else None
+    view = _BreedingFlowView(letter_select, creature_select)
+
+    try:
+        if edit and interaction.message:
+            if interaction.response.is_done():
+                await interaction.followup.edit_message(interaction.message.id, embed=embed, view=view)
+            else:
+                await interaction.response.edit_message(embed=embed, view=view)
+        else:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    except Exception:
+        pass
+
+
+async def run_breeding_calculation(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("⚠️ This needs a server context.", ephemeral=True)
+        return
+    st = _get_session(interaction)
+    creature = st.get("b_creature")
+    if not creature:
+        await interaction.response.send_message("❌ Pick a creature first.", ephemeral=True)
+        return
+
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+
+    settings = await calc_get_settings(interaction.guild.id)
+    try:
+        res = _compute_breeding(creature, settings)
+
+        def _rng(a_s: int, b_s: int) -> str:
+            if a_s == b_s:
+                return _fmt_seconds(a_s)
+            return f"{_fmt_seconds(a_s)} – {_fmt_seconds(b_s)}"
+
+        e = discord.Embed(title=f"🥚 Breeding — {res.get('name') or creature}", color=0x3498DB)
+
+        e.add_field(name="Mating Interval", value=_rng(int(res.get("mating_min_adj_s") or 0), int(res.get("mating_max_adj_s") or 0)), inline=False)
+        e.add_field(name="Incubation / Hatching", value=_fmt_seconds(int(res.get("incubation_adj_s") or 0)), inline=False)
+        e.add_field(name="Baby → Adult Maturation", value=_fmt_seconds(int(res.get("maturation_adj_s") or 0)), inline=False)
+
+        possible = int(res.get("imprints_possible") or 0)
+        times = res.get("imprint_times_s") or []
+        if possible <= 0:
+            e.add_field(name="Imprinting", value="No imprints possible (or creature cannot be imprinted).", inline=False)
+        else:
+            shown = []
+            for t in times[:10]:
+                shown.append(_fmt_seconds(int(t)))
+            extra = ""
+            if possible > 10:
+                extra = f"\n… +{possible-10} more"
+            e.add_field(
+                name="Imprint Schedule",
+                value=f"Possible imprints: **{possible}**\nTimes: " + ", ".join(shown) + extra,
+                inline=False
+            )
+
+        e.add_field(
+            name="Assumptions",
+            value=(
+                f"• Mating Interval Mult: **{settings.mating_interval_mult}x**\n"
+                f"• Hatch Speed: **{settings.egg_hatch_speed}x**\n"
+                f"• Mature Speed: **{settings.baby_mature_speed}x**\n"
+                f"• Cuddle Interval Mult: **{settings.cuddle_interval_mult}x**\n"
+                f"• Imprint Amount Mult: **{settings.imprint_amount_mult}x**"
+            ),
+            inline=False,
+        )
+
+        await interaction.followup.send(embed=e, ephemeral=True)
+    except Exception as ex:
+        await interaction.followup.send(f"⚠️ Breeding calc failed: {ex}", ephemeral=True)
+
+
 class TameCalculatorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Tame", style=discord.ButtonStyle.success, custom_id="tame_calc:tame")
     async def tame_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(_TameCalcModal())
+        await start_tame_calculator_flow(interaction)
 
     @discord.ui.button(label="Breeding", style=discord.ButtonStyle.secondary, custom_id="tame_calc:breeding")
     async def breed_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(_BreedingCalcModal())
+        await start_breeding_calculator_flow(interaction)
 
     @discord.ui.button(label="Reload Data", style=discord.ButtonStyle.primary, custom_id="tame_calc:reload")
     async def reload_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
