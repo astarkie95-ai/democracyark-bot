@@ -3510,58 +3510,91 @@ def _build_calc_settings_embed(guild: discord.Guild, settings: CalcSettings) -> 
     e.timestamp = datetime.utcnow()
     return e
 
-class _CalcSettingsModal(discord.ui.Modal, title="Set Calculator Rates"):
-    # Taming
+class _CalcRatesBasicModal(discord.ui.Modal, title="Set Calculator Rates (Basic)"):
+    """Discord modals support max 5 inputs. This modal covers the common multipliers."""
     taming_speed = discord.ui.TextInput(label="Taming Speed (e.g. 5)", placeholder="5", required=True, max_length=10)
     food_drain = discord.ui.TextInput(label="Food Drain (e.g. 1)", placeholder="1", required=True, max_length=10)
-    single_player = discord.ui.TextInput(label="Use Single Player Settings? (yes/no)", placeholder="no", required=True, max_length=10)
-
-    # Breeding
-    mating_interval = discord.ui.TextInput(label="Mating Interval Mult (e.g. 0.2)", placeholder="0.2", required=True, max_length=10)
+    mating_interval_mult = discord.ui.TextInput(label="Mating Interval Mult (e.g. 0.2)", placeholder="0.2", required=True, max_length=10)
     egg_hatch_speed = discord.ui.TextInput(label="Egg Hatch Speed (e.g. 5)", placeholder="5", required=True, max_length=10)
     baby_mature_speed = discord.ui.TextInput(label="Baby Mature Speed (e.g. 6)", placeholder="6", required=True, max_length=10)
-    cuddle_interval = discord.ui.TextInput(label="Cuddle Interval Mult (e.g. 1)", placeholder="1", required=True, max_length=10)
-    imprint_amount = discord.ui.TextInput(label="Imprint Amount Mult (e.g. 1)", placeholder="1", required=True, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
-        def _f(v: str, default: float) -> float:
+        if not interaction.guild_id or not interaction.guild:
+            return await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+            return await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
+
+        cur = await calc_get_settings(interaction.guild_id)
+
+        def _f(v: str, name: str) -> float:
             try:
                 return float(str(v).strip())
             except Exception:
-                return default
+                raise ValueError(f"Invalid {name}")
 
-        ts = _f(self.taming_speed.value, 5.0)
-        fd = _f(self.food_drain.value, 1.0)
-        sp = str(self.single_player.value).strip().lower() in ("1", "true", "yes", "y", "on")
+        try:
+            cur.taming_speed = _f(self.taming_speed.value, "Taming Speed")
+            cur.food_drain = _f(self.food_drain.value, "Food Drain")
+            cur.mating_interval_mult = _f(self.mating_interval_mult.value, "Mating Interval Mult")
+            cur.egg_hatch_speed = _f(self.egg_hatch_speed.value, "Egg Hatch Speed")
+            cur.baby_mature_speed = _f(self.baby_mature_speed.value, "Baby Mature Speed")
+        except ValueError as e:
+            return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
-        mi = _f(self.mating_interval.value, 0.2)
-        hs = _f(self.egg_hatch_speed.value, 5.0)
-        ms = _f(self.baby_mature_speed.value, 6.0)
-        ci = _f(self.cuddle_interval.value, 1.0)
-        ia = _f(self.imprint_amount.value, 1.0)
+        await calc_set_settings(interaction.guild_id, cur)
 
-        await calc_set_settings(
-            interaction.guild_id,
-            CalcSettings(
-                taming_speed=ts,
-                food_drain=fd,
-                use_single_player_settings=sp,
-                mating_interval_mult=mi,
-                egg_hatch_speed=hs,
-                baby_mature_speed=ms,
-                cuddle_interval_mult=ci,
-                imprint_amount_mult=ia,
-            ),
-        )
-        # refresh both panels
         try:
             await ensure_calc_settings_panel(interaction.guild)
             await ensure_tame_calculator_panel(interaction.guild)
         except Exception:
             pass
-        await interaction.response.send_message("✅ Calculator settings updated.", ephemeral=True)
+
+        await interaction.response.send_message("✅ Basic calculator rates updated.", ephemeral=True)
+
+
+class _CalcRatesAdvancedModal(discord.ui.Modal, title="Set Calculator Rates (Advanced)"):
+    """Advanced breeding + imprint knobs + single-player settings toggle."""
+    cuddle_interval_mult = discord.ui.TextInput(label="Cuddle Interval Mult (e.g. 1)", placeholder="1", required=True, max_length=10)
+    imprint_amount_mult = discord.ui.TextInput(label="Imprint Amount Mult (e.g. 1)", placeholder="1", required=True, max_length=10)
+    single_player = discord.ui.TextInput(label="Use Single Player Settings? (yes/no)", placeholder="no", required=True, max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild_id or not interaction.guild:
+            return await interaction.response.send_message("❌ Server context required.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+            return await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
+
+        cur = await calc_get_settings(interaction.guild_id)
+
+        def _f(v: str, name: str) -> float:
+            try:
+                return float(str(v).strip())
+            except Exception:
+                raise ValueError(f"Invalid {name}")
+
+        sp_raw = str(self.single_player.value or "").strip().lower()
+        sp = sp_raw in ("1", "true", "yes", "y", "on")
+
+        try:
+            cur.cuddle_interval_mult = _f(self.cuddle_interval_mult.value, "Cuddle Interval Mult")
+            cur.imprint_amount_mult = _f(self.imprint_amount_mult.value, "Imprint Amount Mult")
+            cur.use_single_player_settings = bool(sp)
+        except ValueError as e:
+            return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+
+        await calc_set_settings(interaction.guild_id, cur)
+
+        try:
+            await ensure_calc_settings_panel(interaction.guild)
+            await ensure_tame_calculator_panel(interaction.guild)
+        except Exception:
+            pass
+
+        await interaction.response.send_message("✅ Advanced calculator rates updated.", ephemeral=True)
+
 
 class CalcSettingsView(discord.ui.View):
+
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -3585,11 +3618,31 @@ class CalcSettingsView(discord.ui.View):
                 pass
             return False
         return True
+    @discord.ui.button(label="Set Rates (Basic)", style=discord.ButtonStyle.primary, custom_id="calc_settings:set_rates_basic")
+    async def set_rates_basic(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(_CalcRatesBasicModal())
+        except Exception as e:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+            except Exception:
+                pass
 
-    @discord.ui.button(label="Set Rates", style=discord.ButtonStyle.primary, custom_id="calc_settings:set_rates")
-    async def set_rates(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(_CalcSettingsModal())
-
+    @discord.ui.button(label="Set Rates (Advanced)", style=discord.ButtonStyle.secondary, custom_id="calc_settings:set_rates_adv")
+    async def set_rates_adv(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(_CalcRatesAdvancedModal())
+        except Exception as e:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+                else:
+                    await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
+            except Exception:
+                pass
     @discord.ui.button(label="Reset to Defaults", style=discord.ButtonStyle.secondary, custom_id="calc_settings:reset_defaults")
     async def reset_defaults(self, interaction: discord.Interaction, button: discord.ui.Button):
         await calc_set_settings(interaction.guild_id, CalcSettings())
