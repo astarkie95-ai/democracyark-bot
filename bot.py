@@ -36,6 +36,8 @@ GUILD_ID = os.getenv("GUILD_ID", "").strip()  # optional: faster slash command s
 
 PINS_CSV_PATH = os.getenv("PINS_CSV_PATH", "pins.csv")         # pool (unclaimed)
 CLAIMS_CSV_PATH = os.getenv("CLAIMS_CSV_PATH", "claims.csv")   # state (claimed now)
+
+CLAIMED_USERS_CSV_PATH = os.getenv("CLAIMED_USERS_CSV_PATH", "claimed_users.csv")
 RESETS_CSV_PATH = os.getenv("RESETS_CSV_PATH", "resets.csv")   # admin reset log
 
 # ✅ NEW: channel locks for slash commands (set these in Railway Variables)
@@ -322,31 +324,38 @@ async def db_init() -> None:
         print("✅ DB: Connected to Postgres (Neon).", flush=True)
 
         async with DB_POOL.acquire() as conn:
+            
             # Create tables if they don't exist (starter pins system)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS pins_pool (
-                    box INTEGER PRIMARY KEY,
+                    box INT PRIMARY KEY,
                     pin TEXT NOT NULL
                 );
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS claims (
                     user_id BIGINT PRIMARY KEY,
-                    box INTEGER NOT NULL UNIQUE,
+                    box INT NOT NULL,
                     pin TEXT NOT NULL,
                     claimed_at BIGINT NOT NULL
                 );
             """)
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS resets (
-                    reset_at BIGINT NOT NULL,
-                    admin_id BIGINT NOT NULL,
-                    box INTEGER NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    pin TEXT NOT NULL,
-                    reason TEXT
+                CREATE TABLE IF NOT EXISTS starter_claimed_users (
+                    user_id BIGINT PRIMARY KEY,
+                    first_claimed_at BIGINT NOT NULL,
+                    last_box INT,
+                    last_pin TEXT
                 );
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS resets (
+                    id SERIAL PRIMARY KEY,
+                    timestamp BIGINT NOT NULL,
+                    reason TEXT NOT NULL
+                );
+            """)
+
 
             # ✅ NEW: Ticket system tables
             await conn.execute("""
@@ -479,6 +488,25 @@ async def db_save_claims_state(claims: Dict[int, Tuple[int, str]]) -> None:
                     str(pin),
                     now,
                 )
+
+
+async def db_load_claimed_users(con: asyncpg.Connection) -> Set[int]:
+    rows = await con.fetch("SELECT user_id FROM starter_claimed_users")
+    return {int(r["user_id"]) for r in rows}
+
+async def db_mark_user_claimed(con: asyncpg.Connection, user_id: int, box: int | None = None, pin: str | None = None) -> None:
+    # Keep a permanent record that this user has claimed a kit at least once.
+    now_ts = int(time.time())
+    await con.execute(
+        """
+        INSERT INTO starter_claimed_users (user_id, first_claimed_at, last_box, last_pin)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id) DO UPDATE
+            SET last_box = COALESCE(EXCLUDED.last_box, starter_claimed_users.last_box),
+                last_pin = COALESCE(EXCLUDED.last_pin, starter_claimed_users.last_pin)
+        """,
+        int(user_id), now_ts, (int(box) if box is not None else None), pin,
+    )
 
 async def db_append_reset_log(admin_id: int, box: int, user_id: int, pin: str, reason: str = "") -> None:
     if DB_POOL is None:
@@ -1619,6 +1647,18 @@ class StarterKitPanelView(discord.ui.View):
 
         uid = interaction.user.id
 
+        # If they've ever claimed before (even if the vault was recycled later), block re-claim.
+        if uid not in CLAIMS and uid in CLAIMED_USERS:
+            try:
+                await interaction.response.send_message(
+                    "❌ You've already claimed a free starter kit on this server.\n"
+                    "If you need help, open a ticket and a staff member can assist.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
         # One per person check
         if uid in CLAIMS:
             box, pin = CLAIMS[uid]
@@ -2051,7 +2091,7 @@ class _StarterAdminAddModal(discord.ui.Modal, title="Add Starter Vault"):
 
         # Determine the vault number
         used_boxes = set(PINS_POOL.keys()) | {b for (b, _p) in CLAIMS.values()}
-        used_pins = set(PINS_POOL.values()) | {_p for (_b, _p) in CLAIMS.values()}
+        used_pins = {bp.pin for bp in PINS_POOL.values()} | {_p for (_b, _p) in CLAIMS.values()}
 
         if pin in used_pins:
             return await interaction.response.send_message("❌ That PIN is already in use.", ephemeral=True)
@@ -2069,8 +2109,8 @@ class _StarterAdminAddModal(discord.ui.Modal, title="Add Starter Vault"):
             while vault_no in used_boxes:
                 vault_no += 1
 
-        PINS_POOL[vault_no] = pin
-        save_pool_state()
+        PINS_POOL[vault_no] = BoxPin(vault_no, pin)
+        await save_pool_state()
 
         await interaction.response.send_message(f"✅ Added **Vault #{vault_no}** to the pool.", ephemeral=True)
 
@@ -2108,7 +2148,7 @@ class _StarterAdminDeleteModal(discord.ui.Modal, title="Delete Starter Vault"):
 
         if vault_no in PINS_POOL:
             del PINS_POOL[vault_no]
-            save_pool_state()
+            await save_pool_state()
             await interaction.response.send_message(f"✅ Deleted **Vault #{vault_no}** from the pool.", ephemeral=True)
         else:
             # Treat as PIN
@@ -2126,7 +2166,7 @@ class _StarterAdminDeleteModal(discord.ui.Modal, title="Delete Starter Vault"):
                 return await interaction.response.send_message("❌ Not found in the available pool.", ephemeral=True)
 
             del PINS_POOL[vault_to_delete]
-            save_pool_state()
+            await save_pool_state()
             await interaction.response.send_message(f"✅ Deleted **Vault #{vault_to_delete}** from the pool.", ephemeral=True)
 
         # Refresh panels (best-effort)
@@ -2160,6 +2200,22 @@ class StarterVaultAdminView(discord.ui.View):
         if not await self.interaction_check(interaction):
             return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         await interaction.response.send_modal(_StarterAdminDeleteModal())
+@discord.ui.button(label="Recycle Vault", style=discord.ButtonStyle.secondary, custom_id="starteradmin_recycle")
+async def recycle_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+    if not (interaction.user and is_staff(interaction.user)):
+        try:
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    try:
+        await interaction.response.send_modal(_StarterAdminRecycleModal())
+    except Exception:
+        try:
+            await interaction.response.send_message("❌ Unable to open modal.", ephemeral=True)
+        except Exception:
+            pass
+
 
     @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starteradmin_viewclaims")
     async def view_claims(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2370,6 +2426,54 @@ def save_claims_state(claims: Dict[int, Tuple[int, str]]) -> None:
         for uid, (box, pin) in sorted(claims.items(), key=lambda x: x[0]):
             w.writerow([uid, box, pin, now])
 
+
+def load_claimed_users_state() -> Set[int]:
+    ensure_file_exists(CLAIMED_USERS_CSV_PATH, ["user_id", "first_claimed_at", "last_box", "last_pin"])
+    users: Set[int] = set()
+    try:
+        with open(CLAIMED_USERS_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            for row in rdr:
+                try:
+                    users.add(int(row.get("user_id") or 0))
+                except Exception:
+                    continue
+    except Exception:
+        return set()
+    return {u for u in users if u}
+
+def save_claimed_users_state(users: Set[int]) -> None:
+    ensure_file_exists(CLAIMED_USERS_CSV_PATH, ["user_id", "first_claimed_at", "last_box", "last_pin"])
+    # Preserve basic metadata if file already exists, otherwise write minimal rows.
+    existing_meta: dict[int, dict] = {}
+    try:
+        with open(CLAIMED_USERS_CSV_PATH, "r", newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            for row in rdr:
+                try:
+                    uid = int(row.get("user_id") or 0)
+                    if uid:
+                        existing_meta[uid] = row
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    now_ts = int(time.time())
+    with open(CLAIMED_USERS_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["user_id", "first_claimed_at", "last_box", "last_pin"])
+        w.writeheader()
+        for uid in sorted(users):
+            meta = existing_meta.get(uid, {})
+            w.writerow(
+                {
+                    "user_id": uid,
+                    "first_claimed_at": meta.get("first_claimed_at") or str(now_ts),
+                    "last_box": meta.get("last_box") or "",
+                    "last_pin": meta.get("last_pin") or "",
+                }
+            )
+
 def append_reset_log(admin_id: int, box: int, user_id: int, pin: str, reason: str = "") -> None:
     ensure_file_exists(RESETS_CSV_PATH, ["reset_at", "admin_id", "box", "user_id", "pin", "reason"])
     with open(RESETS_CSV_PATH, "a", newline="", encoding="utf-8") as f:
@@ -2383,7 +2487,7 @@ def pool_counts() -> str:
 # ✅ NEW: persistence wrappers (DB preferred, CSV fallback)
 # -----------------------
 async def load_state() -> None:
-    global PINS_POOL, CLAIMS
+    global PINS_POOL, CLAIMS, CLAIMED_USERS
     if DB_POOL is not None:
         PINS_POOL = await db_load_pins_pool()
         CLAIMS = await db_load_claims_state()
@@ -2424,6 +2528,23 @@ async def save_claims_only() -> None:
         await db_save_claims_state(CLAIMS)
     else:
         save_claims_state(CLAIMS)
+
+
+async def save_claimed_users_only() -> None:
+    global CLAIMED_USERS
+    if DATABASE_URL:
+        try:
+            async with db_pool.acquire() as con:
+                # We don't bulk-save here; claimed-users are written on claim via db_mark_user_claimed.
+                # Just keep the in-memory cache warm from DB if needed.
+                CLAIMED_USERS = await db_load_claimed_users(con)
+        except Exception:
+            pass
+    else:
+        try:
+            save_claimed_users_state(CLAIMED_USERS)
+        except Exception:
+            pass
 
 async def log_reset(admin_id: int, box: int, user_id: int, pin: str, reason: str = "") -> None:
     if DB_POOL is not None:
@@ -2882,257 +3003,72 @@ async def resetboxes(interaction: discord.Interaction):
 # -----------------------
 # PLAYER: claim a starter kit
 # -----------------------
-@bot.tree.command(name="claimstarter", description="Claim your starter kit PIN + assigned box number (one per person).")
+@bot.tree.command(name="claimstarter", description="Claim your free starter kit (one per person)")
 async def claimstarter(interaction: discord.Interaction):
     if not interaction.user:
         return
 
-    # ✅ lock starter-kit player command to claim channel
-    if not _only_in_channel(interaction, CLAIM_CHANNEL_ID):
-        await _wrong_channel(interaction, "#claim-starter-kit")
-        return
-
     uid = interaction.user.id
 
-    # One per person check
+    # If they currently have a vault, show it
     if uid in CLAIMS:
         box, pin = CLAIMS[uid]
         await interaction.response.send_message(
-            f"✅ You already claimed a kit.\n**Your box:** #{box}\n**Your PIN:** `{pin}`",
-            ephemeral=True
+            f"✅ You already claimed your starter kit.\nVault: **#{box}**\nPIN: **{pin}**",
+            ephemeral=True,
+        )
+        return
+
+    # If they've ever claimed before (even if a vault was recycled), block re-claim
+    if uid in CLAIMED_USERS:
+        await interaction.response.send_message(
+            "❌ You've already claimed a free starter kit on this server.\n"
+            "If you need help, open a ticket and staff can assist.",
+            ephemeral=True,
         )
         return
 
     if not PINS_POOL:
         await interaction.response.send_message(
-            "❌ No starter kits available right now.\nAsk an admin to add more using `/addpins` or `/addpinsbulk`.",
-            ephemeral=True
+            "❌ Sorry — starter kits are currently out of stock.\n"
+            "Please ask an admin to restock the pool.",
+            ephemeral=True,
         )
         return
 
-    # Pick lowest box number available
+    # Pick a vault from the pool (stable order for predictability)
     box = sorted(PINS_POOL.keys())[0]
     bp = PINS_POOL.pop(box)
+    box, pin = bp.box, bp.pin
 
-    # Persist pool change
+    CLAIMS[uid] = (box, pin)
+
+    # Permanently record that this user has claimed (so recycled vaults don't allow re-claim)
+    CLAIMED_USERS.add(uid)
+    if DATABASE_URL:
+        try:
+            async with db_pool.acquire() as con:
+                await db_mark_user_claimed(con, uid, box=box, pin=pin)
+        except Exception:
+            pass
+    else:
+        await save_claimed_users_only()
+
     await save_pool_state()
-
-    # Record claim in state
-    CLAIMS[uid] = (bp.box, bp.pin)
     await save_claims_only()
 
-    # ✅ keep Starter Kit module panel counts accurate
+    # Update pinned panels if present
     try:
         if interaction.guild:
             await refresh_starter_panel(interaction.guild)
+            await ensure_starter_admin_panel(interaction.guild)
     except Exception:
         pass
 
     await interaction.response.send_message(
-        f"🎁 Starter kit claimed!\n"
-        f"**Your box:** #{bp.box}\n"
-        f"**Your PIN:** `{bp.pin}`\n\n"
-        f"Go to the Community Hub and unlock **Box #{bp.box}** with that PIN.\n\n"
-        f"{pool_counts()}",
-        ephemeral=True
+        f"🎁 Starter kit claimed!\nVault: **#{box}**\nPIN: **{pin}**",
+        ephemeral=True,
     )
-
-# -----------------------
-# POLL (UPDATED: no 1.1 / 2.2, and live public vote counters)
-# -----------------------
-# ✅ Poll system (DB-backed so polls survive restarts)
-# -----------------------
-@dataclass
-class PollState:
-    message_id: int
-    channel_id: int
-    question: str
-    options: List[str]
-    votes: Dict[int, int]  # user_id -> option_index
-    ended: bool
-
-POLL_BY_CHANNEL: Dict[int, PollState] = {}
-
-# ✅ PATCH: prevents Discord dropping edits when multiple votes happen fast
-POLL_LOCKS: Dict[int, asyncio.Lock] = {}
-
-def _get_poll_lock(channel_id: int) -> asyncio.Lock:
-    if channel_id not in POLL_LOCKS:
-        POLL_LOCKS[channel_id] = asyncio.Lock()
-    return POLL_LOCKS[channel_id]
-
-def _poll_counts(poll: PollState) -> List[int]:
-    counts = [0] * len(poll.options)
-    for _uid, idx in (poll.votes or {}).items():
-        if 0 <= int(idx) < len(counts):
-            counts[int(idx)] += 1
-    return counts
-
-def poll_embed(poll: PollState) -> discord.Embed:
-    counts = _poll_counts(poll)
-    total = sum(counts)
-
-    status = "🔒 CLOSED" if poll.ended else "🟢 OPEN"
-    lines = [
-        f"Status      : {status}",
-        f"Total votes : {total}",
-        "",
-        "Options:",
-    ]
-    for i, opt in enumerate(poll.options):
-        lines.append(f"{i+1:>2}. {opt}  —  {counts[i]}")
-
-    e = discord.Embed(
-        title=f"🗳️ Democracy Ark Poll",
-        description=_module_box("VOTE MODULE", [poll.question, ""] + lines),
-        color=0x9B59B6,
-    )
-    e.set_footer(text="Vote using the buttons below. One vote per person; you can change your vote.")
-    e.timestamp = datetime.utcnow()
-    return e
-
-def poll_results_text(poll: PollState) -> str:
-    counts = _poll_counts(poll)
-    total = sum(counts)
-    out = [f"📊 **Results:** {poll.question}", f"Total votes: **{total}**"]
-    for i, opt in enumerate(poll.options):
-        out.append(f"**{i+1}. {opt}** — {counts[i]}")
-    return "\n".join(out)
-
-class PollView(discord.ui.View):
-    def __init__(self, channel_id: int):
-        super().__init__(timeout=None)
-        self.channel_id = int(channel_id)
-
-    def build_buttons(self):
-        self.clear_items()
-
-        poll = POLL_BY_CHANNEL.get(self.channel_id)
-        if not poll:
-            return
-        counts = _poll_counts(poll)
-
-        for idx, opt in enumerate(poll.options[:10]):
-            label = f"{idx+1}. {opt}"
-            # Keep label under Discord limit
-            if len(label) > 80:
-                label = label[:77] + "…"
-            if not poll.ended:
-                label = f"{label} ({counts[idx]})"
-            btn = discord.ui.Button(
-                label=label,
-                style=discord.ButtonStyle.primary if not poll.ended else discord.ButtonStyle.secondary,
-                custom_id=f"poll_vote_{self.channel_id}_{idx}",
-                disabled=bool(poll.ended),
-            )
-
-            async def _cb(interaction: discord.Interaction, option_index=idx):
-                await poll_handle_vote(interaction, self.channel_id, int(option_index))
-
-            btn.callback = _cb
-            self.add_item(btn)
-
-async def poll_handle_vote(interaction: discord.Interaction, channel_id: int, option_index: int):
-    if not interaction.user:
-        return
-    poll = POLL_BY_CHANNEL.get(int(channel_id))
-    if not poll:
-        try:
-            await interaction.response.send_message("❌ This poll is no longer available.", ephemeral=True)
-        except Exception:
-            pass
-        return
-    if poll.ended:
-        try:
-            await interaction.response.send_message("🔒 This poll is closed.", ephemeral=True)
-        except Exception:
-            pass
-        return
-    if option_index < 0 or option_index >= len(poll.options):
-        try:
-            await interaction.response.send_message("❌ Invalid option.", ephemeral=True)
-        except Exception:
-            pass
-        return
-
-    lock = _get_poll_lock(int(channel_id))
-    async with lock:
-        poll.votes[int(interaction.user.id)] = int(option_index)
-        try:
-            await db_record_poll_vote(poll.message_id, interaction.user.id, option_index)
-        except Exception:
-            pass
-
-        # Update the public message with new counts
-        try:
-            if interaction.message:
-                view = PollView(channel_id)
-                view.build_buttons()
-                await interaction.message.edit(embed=poll_embed(poll), view=view)
-        except Exception:
-            pass
-
-    # ACK
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("✅ Vote recorded.", ephemeral=True)
-        else:
-            await interaction.followup.send("✅ Vote recorded.", ephemeral=True)
-    except Exception:
-        pass
-
-async def _create_poll_message(channel: discord.TextChannel, question: str, options: List[str]) -> Optional[PollState]:
-    channel_id = int(channel.id)
-
-    existing = POLL_BY_CHANNEL.get(channel_id)
-    if existing and not existing.ended:
-        return None
-
-    poll_state = PollState(
-        message_id=0,
-        channel_id=channel_id,
-        question=str(question or "").strip(),
-        options=[str(o).strip() for o in (options or []) if str(o).strip()][:10],
-        votes={},
-        ended=False,
-    )
-    POLL_BY_CHANNEL[channel_id] = poll_state
-
-    view = PollView(channel_id)
-    view.build_buttons()
-
-    msg = await channel.send(embed=poll_embed(poll_state), view=view)
-    poll_state.message_id = int(msg.id)
-
-    # DB
-    try:
-        await db_upsert_poll(poll_state.message_id, poll_state.channel_id, poll_state.question, poll_state.options, ended=False)
-    except Exception:
-        pass
-
-    return poll_state
-
-async def create_poll_in_channel(guild: discord.Guild, channel_id: int, question: str, options: List[str], created_by: Optional[discord.abc.User] = None) -> Tuple[bool, str]:
-    ch = await _get_text_channel(guild, str(channel_id))
-    if not ch:
-        return False, "Vote channel not found."
-    if not isinstance(ch, discord.TextChannel):
-        return False, "Vote channel is not a text channel."
-
-    existing = POLL_BY_CHANNEL.get(int(channel_id))
-    if existing and not existing.ended:
-        return False, "There is already an active poll in #vote. End it first."
-
-    try:
-        poll = await _create_poll_message(ch, question, options)
-    except Exception as e:
-        return False, f"Failed to create poll: {repr(e)}"
-
-    if not poll:
-        return False, "There is already an active poll in #vote. End it first."
-
-    who = f" by {created_by.mention}" if created_by else ""
-    return True, f"Poll created{who}."
 
 @bot.tree.command(name="poll", description="Admin: Create a poll with up to 10 options.")
 @app_commands.describe(
@@ -3540,6 +3476,8 @@ class TicketControlsView(discord.ui.View):
             await interaction.response.send_message("❌ Staff only.", ephemeral=True)
             return
         await interaction.response.send_modal(_TicketDeleteConfirmModal())
+    
+
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="ticket_ctrl_close")
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Staff only
