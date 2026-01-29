@@ -6,6 +6,7 @@ import io
 import re
 import random
 import math
+import sys
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from html.parser import HTMLParser
