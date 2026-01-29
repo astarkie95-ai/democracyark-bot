@@ -3905,101 +3905,113 @@ class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
     weapon = discord.ui.TextInput(label="KO Weapon (optional: crossbow/bow/dart/shocking)", placeholder="crossbow", required=False, max_length=30)
     weapon_damage = discord.ui.TextInput(label="Weapon Damage % (optional, default 100)", placeholder="100", required=False, max_length=10)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        creature_name = str(self.creature.value).strip()
+async def on_submit(self, interaction: discord.Interaction):
+    # ✅ IMPORTANT: acknowledge quickly to avoid "Interaction Failed" if we need to fetch wiki data.
+    async def _send(*, content: Optional[str] = None, embed: Optional[discord.Embed] = None):
         try:
-            lvl = int(re.sub(r"[^0-9]", "", str(self.level.value))) if str(self.level.value).strip() else 1
+            if interaction.response.is_done():
+                await interaction.followup.send(content=content, embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(content=content, embed=embed, ephemeral=True)
         except Exception:
-            lvl = 1
-        settings = await calc_get_settings(interaction.guild_id)
+            pass
 
-        # Attempt to load data; if it fails, fall back to link-only mode (no manual input required beyond clicking).
-        ok = await ensure_taming_data_loaded()
-        if not ok:
-            slug = _slugify_creature(creature_name)
-            url = f"https://www.dododex.com/taming/{slug}" if slug else "https://www.dododex.com/"
-            desc_lines = [
-                f"**Creature:** {creature_name}",
-                f"**Wild Level:** {lvl}",
-                f"**Server Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**",
-                "",
-                "⚠️ Calculator data failed to load right now, so here’s a quick link:",
-            ]
-            e = discord.Embed(title="🧮 Tame Calculation (Link Mode)", description="\n".join(desc_lines), color=0x3498DB)
-            e.add_field(name="Dododex", value=url, inline=False)
-            e.timestamp = datetime.utcnow()
-            await interaction.response.send_message(embed=e, ephemeral=True)
-            return
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        # If defer fails for any reason, we still try to respond via _send().
+        pass
 
-        creature_key = _resolve_creature_key(creature_name)
-        if not creature_key:
-            await interaction.response.send_message(
-                f"❌ I couldn't find that creature. Try a simpler name (example: **Raptor**, **Argentavis**, **Ankylosaurus**).",
-                ephemeral=True,
-            )
-            return
+    creature_name = str(self.creature.value).strip()
+    try:
+        lvl = int(re.sub(r"[^0-9]", "", str(self.level.value))) if str(self.level.value).strip() else 1
+    except Exception:
+        lvl = 1
+    settings = await calc_get_settings(interaction.guild_id)
 
-        wtxt = str(self.weapon.value).strip()
-        try:
-            w_dmg = float(re.sub(r"[^0-9.]", "", str(self.weapon_damage.value))) if str(self.weapon_damage.value).strip() else 100.0
-        except Exception:
-            w_dmg = 100.0
-
-        try:
-            result = _compute_taming(
-                creature_key=creature_key,
-                level=lvl,
-                settings=settings,
-                food_pref=str(self.food.value or "").strip(),
-                weapon_text=wtxt,
-                weapon_damage_pct=w_dmg,
-            )
-        except Exception:
-            await interaction.response.send_message(
-                "❌ I couldn't calculate that tame with the options provided. Try a different food (or leave it blank).",
-                ephemeral=True,
-            )
-            return
-
-        lines = [
-            f"**Creature:** {creature_key}",
+    # Attempt to load data; if it fails, fall back to link-only mode.
+    ok = await ensure_taming_data_loaded()
+    if not ok:
+        slug = _slugify_creature(creature_name)
+        url = f"https://www.dododex.com/taming/{slug}" if slug else "https://www.dododex.com/"
+        desc_lines = [
+            f"**Creature:** {creature_name}",
             f"**Wild Level:** {lvl}",
-            f"**Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**",
-            f"**Food:** {result['food_display']} × **{result['food_pieces']}**",
-            f"**Estimated Time:** **{_format_hms(result['seconds'])}**",
+            f"**Server Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**",
+            "",
+            "⚠️ Calculator data failed to load right now, so here’s a quick link:",
         ]
-
-        e = discord.Embed(title="🦖 Democracy Ark — Tame Calculator", description="\n".join(lines), color=0x2ECC71)
+        e = discord.Embed(title="🧮 Tame Calculation (Link Mode)", description="\n".join(desc_lines), color=0x3498DB)
+        e.add_field(name="Dododex", value=url, inline=False)
         e.timestamp = datetime.utcnow()
+        await _send(embed=e)
+        return
 
-        if result["non_violent"]:
+    creature_key = _resolve_creature_key(creature_name)
+    if not creature_key:
+        await _send(content=(
+            f"❌ I couldn't find that creature. Try a simpler name (example: **Raptor**, **Argentavis**, **Ankylosaurus**)."
+        ))
+        return
+
+    wtxt = str(self.weapon.value).strip()
+    try:
+        w_dmg = float(re.sub(r"[^0-9.]", "", str(self.weapon_damage.value))) if str(self.weapon_damage.value).strip() else 100.0
+    except Exception:
+        w_dmg = 100.0
+
+    try:
+        result = _compute_taming(
+            creature_key=creature_key,
+            level=lvl,
+            settings=settings,
+            food_pref=str(self.food.value or "").strip(),
+            weapon_text=wtxt,
+            weapon_damage_pct=w_dmg,
+        )
+    except Exception:
+        await _send(content="❌ I couldn't calculate that tame with the options provided. Try a different food (or leave it blank).")
+        return
+
+    lines = [
+        f"**Creature:** {creature_key}",
+        f"**Wild Level:** {lvl}",
+        f"**Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**",
+        f"**Food:** {result['food_display']} × **{result['food_pieces']}**",
+        f"**Estimated Time:** **{_format_hms(result['seconds'])}**",
+    ]
+
+    e = discord.Embed(title="🦖 Democracy Ark — Tame Calculator", description="\n".join(lines), color=0x2ECC71)
+    e.timestamp = datetime.utcnow()
+
+    if result["non_violent"]:
+        e.add_field(
+            name="Notes",
+            value="This creature uses **non-violent** taming. Torpor / narcotics are not required.",
+            inline=False,
+        )
+    else:
+        t = result["torpor"] or {}
+        if t:
             e.add_field(
-                name="Notes",
-                value="This creature uses **non-violent** taming. Torpor / narcotics are not required.",
+                name="Keep it asleep",
+                value=(
+                    f"Total Torpor: **{int(t['total_torpor'])}**\n"
+                    f"Torpor drain: **{t['torpor_depl_ps']:.2f}/s**\n"
+                    f"Extra Torpor needed during tame: **{int(t['torpor_needed'])}**\n"
+                    f"Narcoberries: **{t['narco_berries']}** • Narcotics: **{t['narcotics']}** • Bio Toxin: **{t['bio_toxin']}**"
+                ),
                 inline=False,
             )
-        else:
-            t = result["torpor"] or {}
-            if t:
+            if t.get("shots") is not None:
                 e.add_field(
-                    name="Keep it asleep",
-                    value=(
-                        f"Total Torpor: **{int(t['total_torpor'])}**\n"
-                        f"Torpor drain: **{t['torpor_depl_ps']:.2f}/s**\n"
-                        f"Extra Torpor needed during tame: **{int(t['torpor_needed'])}**\n"
-                        f"Narcoberries: **{t['narco_berries']}** • Narcotics: **{t['narcotics']}** • Bio Toxin: **{t['bio_toxin']}**"
-                    ),
+                    name="KO estimate (rough)",
+                    value=f"{t['weapon_label']} @ **{t['weapon_damage_pct']:.0f}%** → **~{t['shots']}** shots/hits (100% accuracy, no headshot modifiers).",
                     inline=False,
                 )
-                if t.get("shots") is not None:
-                    e.add_field(
-                        name="KO estimate (rough)",
-                        value=f"{t['weapon_label']} @ **{t['weapon_damage_pct']:.0f}%** → **~{t['shots']}** shots/hits (100% accuracy, no headshot modifiers).",
-                        inline=False,
-                    )
 
-        e.set_footer(text="Estimates use official wiki taming tables, adjusted by your server multipliers.")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+    e.set_footer(text="Estimates use official wiki taming tables, adjusted by your server multipliers.")
+    await _send(embed=e)
 
 class TameCalculatorView(discord.ui.View):
     def __init__(self):
