@@ -8,6 +8,7 @@ import random
 import math
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Dict, Optional, List, Tuple, Set, Any
 
 import discord
@@ -700,9 +701,28 @@ async def db_init() -> None:
                     taming_speed DOUBLE PRECISION NOT NULL DEFAULT 5.0,
                     food_drain DOUBLE PRECISION NOT NULL DEFAULT 1.0,
                     use_single_player_settings BOOLEAN NOT NULL DEFAULT FALSE,
+
+                    -- Breeding multipliers
+                    mating_interval_mult DOUBLE PRECISION NOT NULL DEFAULT 0.2,
+                    egg_hatch_speed DOUBLE PRECISION NOT NULL DEFAULT 5.0,
+                    baby_mature_speed DOUBLE PRECISION NOT NULL DEFAULT 6.0,
+                    cuddle_interval_mult DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                    imprint_amount_mult DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+
                     updated_at BIGINT NOT NULL DEFAULT 0
                 );
             """)
+
+            # ✅ NEW: calc_settings migrations (safe on existing DB)
+            try:
+                await conn.execute("ALTER TABLE calc_settings ADD COLUMN IF NOT EXISTS mating_interval_mult DOUBLE PRECISION NOT NULL DEFAULT 0.2;")
+                await conn.execute("ALTER TABLE calc_settings ADD COLUMN IF NOT EXISTS egg_hatch_speed DOUBLE PRECISION NOT NULL DEFAULT 5.0;")
+                await conn.execute("ALTER TABLE calc_settings ADD COLUMN IF NOT EXISTS baby_mature_speed DOUBLE PRECISION NOT NULL DEFAULT 6.0;")
+                await conn.execute("ALTER TABLE calc_settings ADD COLUMN IF NOT EXISTS cuddle_interval_mult DOUBLE PRECISION NOT NULL DEFAULT 1.0;")
+                await conn.execute("ALTER TABLE calc_settings ADD COLUMN IF NOT EXISTS imprint_amount_mult DOUBLE PRECISION NOT NULL DEFAULT 1.0;")
+            except Exception:
+                pass
+
             print("✅ DB: tables ensured.", flush=True)
             print("✅ DB: ticket tables ensured.", flush=True)
 
@@ -3332,9 +3352,19 @@ async def ensure_role_manager_panel(guild: discord.Guild) -> None:
 
 @dataclass
 class CalcSettings:
+    # Taming
     taming_speed: float = 5.0
     food_drain: float = 1.0
     use_single_player_settings: bool = False
+
+    # Breeding (ASA/ASE style multipliers)
+    # Hatch/Mature are "speed" multipliers (higher = faster, so time divides by this).
+    # Interval multipliers are "duration" multipliers (higher = longer, so time multiplies by this).
+    mating_interval_mult: float = 0.2
+    egg_hatch_speed: float = 5.0
+    baby_mature_speed: float = 6.0
+    cuddle_interval_mult: float = 1.0
+    imprint_amount_mult: float = 1.0
 
 async def calc_get_settings(guild_id: int) -> CalcSettings:
     """Fetch calc settings from DB; fall back to defaults if missing."""
@@ -3344,7 +3374,7 @@ async def calc_get_settings(guild_id: int) -> CalcSettings:
         async with DB_POOL.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT taming_speed, food_drain, use_single_player_settings
+                SELECT taming_speed, food_drain, use_single_player_settings, mating_interval_mult, egg_hatch_speed, baby_mature_speed, cuddle_interval_mult, imprint_amount_mult
                 FROM calc_settings
                 WHERE guild_id = $1
                 """,
@@ -3354,14 +3384,19 @@ async def calc_get_settings(guild_id: int) -> CalcSettings:
                 # Create default row lazily
                 await conn.execute(
                     """
-                    INSERT INTO calc_settings (guild_id, taming_speed, food_drain, use_single_player_settings, updated_at)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO calc_settings (guild_id, taming_speed, food_drain, use_single_player_settings, mating_interval_mult, egg_hatch_speed, baby_mature_speed, cuddle_interval_mult, imprint_amount_mult, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     ON CONFLICT (guild_id) DO NOTHING
                     """,
                     guild_id,
                     float(CalcSettings.taming_speed),
                     float(CalcSettings.food_drain),
                     bool(CalcSettings.use_single_player_settings),
+                    float(CalcSettings.mating_interval_mult),
+                    float(CalcSettings.egg_hatch_speed),
+                    float(CalcSettings.baby_mature_speed),
+                    float(CalcSettings.cuddle_interval_mult),
+                    float(CalcSettings.imprint_amount_mult),
                     int(time.time()),
                 )
                 return CalcSettings()
@@ -3369,6 +3404,11 @@ async def calc_get_settings(guild_id: int) -> CalcSettings:
                 taming_speed=float(row["taming_speed"]) if row["taming_speed"] is not None else 5.0,
                 food_drain=float(row["food_drain"]) if row["food_drain"] is not None else 1.0,
                 use_single_player_settings=bool(row["use_single_player_settings"]) if row["use_single_player_settings"] is not None else False,
+                mating_interval_mult=float(row["mating_interval_mult"]) if row["mating_interval_mult"] is not None else 0.2,
+                egg_hatch_speed=float(row["egg_hatch_speed"]) if row["egg_hatch_speed"] is not None else 5.0,
+                baby_mature_speed=float(row["baby_mature_speed"]) if row["baby_mature_speed"] is not None else 6.0,
+                cuddle_interval_mult=float(row["cuddle_interval_mult"]) if row["cuddle_interval_mult"] is not None else 1.0,
+                imprint_amount_mult=float(row["imprint_amount_mult"]) if row["imprint_amount_mult"] is not None else 1.0,
             )
     except Exception:
         return CalcSettings()
@@ -3380,18 +3420,28 @@ async def calc_set_settings(guild_id: int, settings: CalcSettings) -> None:
         async with DB_POOL.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO calc_settings (guild_id, taming_speed, food_drain, use_single_player_settings, updated_at)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO calc_settings (guild_id, taming_speed, food_drain, use_single_player_settings, mating_interval_mult, egg_hatch_speed, baby_mature_speed, cuddle_interval_mult, imprint_amount_mult, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (guild_id) DO UPDATE
                 SET taming_speed = EXCLUDED.taming_speed,
                     food_drain = EXCLUDED.food_drain,
                     use_single_player_settings = EXCLUDED.use_single_player_settings,
+                    mating_interval_mult = EXCLUDED.mating_interval_mult,
+                    egg_hatch_speed = EXCLUDED.egg_hatch_speed,
+                    baby_mature_speed = EXCLUDED.baby_mature_speed,
+                    cuddle_interval_mult = EXCLUDED.cuddle_interval_mult,
+                    imprint_amount_mult = EXCLUDED.imprint_amount_mult,
                     updated_at = EXCLUDED.updated_at
                 """,
                 guild_id,
                 float(settings.taming_speed),
                 float(settings.food_drain),
                 bool(settings.use_single_player_settings),
+                float(settings.mating_interval_mult),
+                float(settings.egg_hatch_speed),
+                float(settings.baby_mature_speed),
+                float(settings.cuddle_interval_mult),
+                float(settings.imprint_amount_mult),
                 int(time.time()),
             )
     except Exception:
@@ -3421,7 +3471,12 @@ def _build_tame_calc_embed(guild: discord.Guild, settings: CalcSettings) -> disc
         f"Taming Speed: **{settings.taming_speed}x**",
         f"Food Drain: **{settings.food_drain}x**",
         f"Single Player Settings: **{'ON' if settings.use_single_player_settings else 'OFF'}**",
-        "Use **Calculate** below to get food, time, narcotics, and a KO estimate (based on standard weapon damage).",
+        "",
+        f"Mating Interval Mult: **{settings.mating_interval_mult}x**",
+        f"Egg Hatch Speed: **{settings.egg_hatch_speed}x**",
+        f"Baby Mature Speed: **{settings.baby_mature_speed}x**",
+        "",
+        "Use **Tame** or **Breeding** below to calculate in Discord (no external links).",
     ]
     e = discord.Embed(
         title="🦖 Democracy Ark — Tame Calculator",
@@ -3437,6 +3492,13 @@ def _build_calc_settings_embed(guild: discord.Guild, settings: CalcSettings) -> 
         f"Taming Speed: **{settings.taming_speed}x**",
         f"Food Drain: **{settings.food_drain}x**",
         f"Single Player Settings: **{'ON' if settings.use_single_player_settings else 'OFF'}**",
+        "",
+        f"Mating Interval Mult: **{settings.mating_interval_mult}x**",
+        f"Egg Hatch Speed: **{settings.egg_hatch_speed}x**",
+        f"Baby Mature Speed: **{settings.baby_mature_speed}x**",
+        f"Cuddle Interval Mult: **{settings.cuddle_interval_mult}x**",
+        f"Imprint Amount Mult: **{settings.imprint_amount_mult}x**",
+        "",
         "Staff: update these so the public calculator panel stays accurate.",
         "(Uses DB if available; otherwise defaults are used.)",
     ]
@@ -3449,21 +3511,48 @@ def _build_calc_settings_embed(guild: discord.Guild, settings: CalcSettings) -> 
     return e
 
 class _CalcSettingsModal(discord.ui.Modal, title="Set Calculator Rates"):
+    # Taming
     taming_speed = discord.ui.TextInput(label="Taming Speed (e.g. 5)", placeholder="5", required=True, max_length=10)
     food_drain = discord.ui.TextInput(label="Food Drain (e.g. 1)", placeholder="1", required=True, max_length=10)
     single_player = discord.ui.TextInput(label="Use Single Player Settings? (yes/no)", placeholder="no", required=True, max_length=10)
 
+    # Breeding
+    mating_interval = discord.ui.TextInput(label="Mating Interval Mult (e.g. 0.2)", placeholder="0.2", required=True, max_length=10)
+    egg_hatch_speed = discord.ui.TextInput(label="Egg Hatch Speed (e.g. 5)", placeholder="5", required=True, max_length=10)
+    baby_mature_speed = discord.ui.TextInput(label="Baby Mature Speed (e.g. 6)", placeholder="6", required=True, max_length=10)
+    cuddle_interval = discord.ui.TextInput(label="Cuddle Interval Mult (e.g. 1)", placeholder="1", required=True, max_length=10)
+    imprint_amount = discord.ui.TextInput(label="Imprint Amount Mult (e.g. 1)", placeholder="1", required=True, max_length=10)
+
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            ts = float(str(self.taming_speed.value).strip())
-        except Exception:
-            ts = 5.0
-        try:
-            fd = float(str(self.food_drain.value).strip())
-        except Exception:
-            fd = 1.0
+        def _f(v: str, default: float) -> float:
+            try:
+                return float(str(v).strip())
+            except Exception:
+                return default
+
+        ts = _f(self.taming_speed.value, 5.0)
+        fd = _f(self.food_drain.value, 1.0)
         sp = str(self.single_player.value).strip().lower() in ("1", "true", "yes", "y", "on")
-        await calc_set_settings(interaction.guild_id, CalcSettings(taming_speed=ts, food_drain=fd, use_single_player_settings=sp))
+
+        mi = _f(self.mating_interval.value, 0.2)
+        hs = _f(self.egg_hatch_speed.value, 5.0)
+        ms = _f(self.baby_mature_speed.value, 6.0)
+        ci = _f(self.cuddle_interval.value, 1.0)
+        ia = _f(self.imprint_amount.value, 1.0)
+
+        await calc_set_settings(
+            interaction.guild_id,
+            CalcSettings(
+                taming_speed=ts,
+                food_drain=fd,
+                use_single_player_settings=sp,
+                mating_interval_mult=mi,
+                egg_hatch_speed=hs,
+                baby_mature_speed=ms,
+                cuddle_interval_mult=ci,
+                imprint_amount_mult=ia,
+            ),
+        )
         # refresh both panels
         try:
             await ensure_calc_settings_panel(interaction.guild)
@@ -3898,6 +3987,272 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
         "torpor": torpor_block,
     }
 
+
+
+# =====================================================================
+# ✅ NEW: Breeding data + calculator (parsed from ARK Wiki/Fandom Table_of_Breeding)
+# =====================================================================
+
+_BREEDING_DATA: Optional[Dict[str, Any]] = None
+_BREEDING_LOADED_AT: int = 0
+_BREEDING_LOCK = asyncio.Lock()
+
+# Fandom page with the canonical times table (covers most creatures).
+_BREEDING_TABLE_URL = "https://ark.fandom.com/wiki/Table_of_Breeding?oldformat=true&action=render"
+
+def _parse_time_to_seconds(s: str) -> Optional[int]:
+    """Parse time strings like '1d 22:17', '18:31', '4:59', '2h 10m', '3m 20s'."""
+    if not s:
+        return None
+    t = s.strip().lower()
+    t = t.replace("\u2013", "-").replace("\u2014", "-")  # en/em dash
+    # Strip footnotes and brackets
+    t = re.sub(r"\[[^\]]*\]", "", t).strip()
+
+    # '18:00-48:00' (range) is handled elsewhere
+    if re.fullmatch(r"\d+\s*d\s*\d{1,2}:\d{2}", t):
+        d, hm = t.split("d", 1)
+        days = int(d.strip())
+        h, m = hm.strip().split(":")
+        return days * 86400 + int(h) * 3600 + int(m) * 60
+
+    if re.fullmatch(r"\d{1,2}:\d{2}", t):
+        h, m = t.split(":")
+        return int(h) * 3600 + int(m) * 60
+
+    # minutes:seconds
+    if re.fullmatch(r"\d{1,3}:\d{2}", t):
+        m, s2 = t.split(":")
+        return int(m) * 60 + int(s2)
+
+    # '1d 2h 3m 4s' / '2h 10m' etc.
+    total = 0
+    found = False
+    for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([dhms])", t):
+        found = True
+        val = float(num)
+        if unit == "d":
+            total += int(val * 86400)
+        elif unit == "h":
+            total += int(val * 3600)
+        elif unit == "m":
+            total += int(val * 60)
+        elif unit == "s":
+            total += int(val)
+    return total if found else None
+
+def _parse_range_to_seconds(s: str) -> Tuple[Optional[int], Optional[int]]:
+    """Parse time ranges like '18:00–48:00' -> (min,max) seconds."""
+    if not s:
+        return None, None
+    t = s.strip().replace("\u2013", "-").replace("\u2014", "-")
+    # normalize separator to '-'
+    t = re.sub(r"\s*[\-–—]\s*", "-", t)
+    if "-" not in t:
+        v = _parse_time_to_seconds(t)
+        return v, v
+    a, b = t.split("-", 1)
+    return _parse_time_to_seconds(a.strip()), _parse_time_to_seconds(b.strip())
+
+class _BreedingHTMLParser(HTMLParser):
+    """Extracts the first main breeding wikitable rows into a list of columns."""
+    def __init__(self):
+        super().__init__()
+        self.in_table = False
+        self.in_tr = False
+        self.in_td = False
+        self.cur = []
+        self.rows = []
+        self.buf = []
+        self.tables_seen = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "table":
+            cls = attrs.get("class", "")
+            if "wikitable" in cls or "sortable" in cls:
+                self.tables_seen += 1
+                # The big breeding times table is typically the first/second wikitable on the page.
+                if self.tables_seen <= 3:
+                    self.in_table = True
+        if self.in_table and tag == "tr":
+            self.in_tr = True
+            self.cur = []
+        if self.in_tr and tag in ("td", "th"):
+            self.in_td = True
+            self.buf = []
+
+    def handle_endtag(self, tag):
+        if self.in_td and tag in ("td", "th"):
+            txt = " ".join("".join(self.buf).split())
+            self.cur.append(txt)
+            self.in_td = False
+            self.buf = []
+        if self.in_tr and tag == "tr":
+            if self.cur and len(self.cur) >= 6:
+                self.rows.append(self.cur)
+            self.in_tr = False
+            self.cur = []
+        if self.in_table and tag == "table":
+            # stop after we collected a healthy number of rows
+            if len(self.rows) >= 50:
+                self.in_table = False
+            else:
+                self.in_table = False
+
+    def handle_data(self, data):
+        if self.in_td:
+            self.buf.append(data)
+
+async def ensure_breeding_data_loaded(force: bool = False) -> bool:
+    global _BREEDING_DATA, _BREEDING_LOADED_AT
+    if not force and _BREEDING_DATA and (time.time() - _BREEDING_LOADED_AT) < 7 * 24 * 3600:
+        return True
+    async with _BREEDING_LOCK:
+        if not force and _BREEDING_DATA and (time.time() - _BREEDING_LOADED_AT) < 7 * 24 * 3600:
+            return True
+        try:
+            html = await _fetch_text(_BREEDING_TABLE_URL)
+            p = _BreedingHTMLParser()
+            p.feed(html)
+
+            data: Dict[str, Any] = {}
+            for r in p.rows:
+                # Expected structure from fandom Table_of_Breeding:
+                # [Species, ... , Incubation Time, Baby, Juvenile, Adolescent, Total, Mating Interval]
+                # But the exact column count varies (temperature columns, images, etc.)
+                # We'll find times by scanning for recognizable patterns.
+                species = (r[0] or "").strip()
+                if not species or species.lower() in ("species", "visual"):
+                    continue
+
+                # Find a "total" maturation cell (has 'd' or ':'), typically one of the last few columns before mating interval.
+                # We'll use the last time-like cell as total, and last range-like as mating interval.
+                time_cells = [c for c in r if re.search(r"(\d+\s*d\s*\d{1,2}:\d{2}|\d{1,3}:\d{2}|\d+\s*[dhms])", c.lower())]
+                if not time_cells:
+                    continue
+
+                # Mating interval range usually contains '-' or '–'
+                mating_cell = None
+                for c in reversed(r):
+                    if "–" in c or "-" in c:
+                        # avoid temperatures like '26 32' (no ':')
+                        if re.search(r"\d", c) and (":" in c or "h" in c.lower() or "d" in c.lower()):
+                            mating_cell = c
+                            break
+
+                # Incubation/hatch time is often a small hh:mm near the first half of the time columns
+                incubation = None
+                total = None
+
+                # Heuristic: "Total" often appears just before mating interval and is the longest duration-like cell.
+                parsed_times = []
+                for c in time_cells:
+                    v = _parse_time_to_seconds(c)
+                    if v is not None:
+                        parsed_times.append((v, c))
+                if parsed_times:
+                    total = max(parsed_times, key=lambda x: x[0])[0]
+                    # Incubation tends to be one of the smallest non-zero times
+                    incubation = min(parsed_times, key=lambda x: x[0])[0]
+
+                mating_min, mating_max = _parse_range_to_seconds(mating_cell) if mating_cell else (None, None)
+
+                data[_normalize_name(species)] = {
+                    "name": species,
+                    "incubation_s": incubation,
+                    "maturation_s": total,
+                    "mating_min_s": mating_min,
+                    "mating_max_s": mating_max,
+                }
+
+            if not data:
+                raise RuntimeError("no rows parsed")
+
+            _BREEDING_DATA = data
+            _BREEDING_LOADED_AT = int(time.time())
+            print(f"✅ BREED: loaded {len(data)} breeding rows from Table_of_Breeding.", flush=True)
+            return True
+        except Exception:
+            print("⚠️ BREED: failed to load breeding data.\n" + traceback.format_exc(), flush=True)
+            _BREEDING_DATA = None
+            return False
+
+def _resolve_breeding_key(name: str) -> Optional[str]:
+    key = _normalize_name(name)
+    if not key:
+        return None
+    if _BREEDING_DATA and key in _BREEDING_DATA:
+        return key
+    # fuzzy: try contains
+    if _BREEDING_DATA:
+        for k, v in _BREEDING_DATA.items():
+            if key in k or k in key:
+                return k
+            if key in _normalize_name(v.get("name","")):
+                return k
+    return None
+
+def _compute_breeding(creature_key: str, settings: CalcSettings) -> Dict[str, Any]:
+    if not _BREEDING_DATA:
+        raise RuntimeError("breeding data not loaded")
+    row = _BREEDING_DATA.get(creature_key)
+    if not row:
+        raise RuntimeError("unknown creature")
+
+    incubation = int(row.get("incubation_s") or 0)
+    maturation = int(row.get("maturation_s") or 0)
+    mating_min = row.get("mating_min_s")
+    mating_max = row.get("mating_max_s")
+
+    # Apply multipliers
+    egg_hatch_speed = max(0.01, float(settings.egg_hatch_speed or 1.0))
+    baby_mature_speed = max(0.01, float(settings.baby_mature_speed or 1.0))
+    mating_interval_mult = max(0.01, float(settings.mating_interval_mult or 1.0))
+    cuddle_interval_mult = max(0.001, float(settings.cuddle_interval_mult or 1.0))
+    imprint_amount_mult = max(0.01, float(settings.imprint_amount_mult or 1.0))
+
+    incubation_adj = int(incubation / egg_hatch_speed) if incubation else 0
+    maturation_adj = int(maturation / baby_mature_speed) if maturation else 0
+
+    def _mul_or_none(v):
+        return int(v * mating_interval_mult) if isinstance(v, (int, float)) and v else None
+
+    mating_min_adj = _mul_or_none(mating_min)
+    mating_max_adj = _mul_or_none(mating_max)
+
+    # Imprint schedule:
+    # Default base imprint period is 8h, multiplied by BabyCuddleIntervalMultiplier.
+    base_period = int(8 * 3600 * cuddle_interval_mult)
+    possible = 0
+    times = []
+    if maturation_adj and base_period > 0:
+        possible = max(0, maturation_adj // base_period)
+        # show up to first 10 imprint times
+        for i in range(1, min(possible, 10) + 1):
+            times.append(i * base_period)
+
+    return {
+        "name": row.get("name") or creature_key,
+        "incubation_s": incubation,
+        "maturation_s": maturation,
+        "mating_min_s": mating_min,
+        "mating_max_s": mating_max,
+        "incubation_adj_s": incubation_adj,
+        "maturation_adj_s": maturation_adj,
+        "mating_min_adj_s": mating_min_adj,
+        "mating_max_adj_s": mating_max_adj,
+        "imprint_period_s": base_period,
+        "imprints_possible": possible,
+        "imprint_times_s": times,
+        "settings": {
+            "mating_interval_mult": mating_interval_mult,
+            "egg_hatch_speed": egg_hatch_speed,
+            "baby_mature_speed": baby_mature_speed,
+            "cuddle_interval_mult": cuddle_interval_mult,
+            "imprint_amount_mult": imprint_amount_mult,
+        },
+    }
 class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
     creature = discord.ui.TextInput(label="Creature (e.g. Raptor)", placeholder="Raptor", required=True, max_length=60)
     level = discord.ui.TextInput(label="Wild Level (e.g. 150)", placeholder="150", required=True, max_length=10)
@@ -3932,19 +4287,7 @@ class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
         # Attempt to load data; if it fails, fall back to link-only mode.
         ok = await ensure_taming_data_loaded()
         if not ok:
-            slug = _slugify_creature(creature_name)
-            url = f"https://www.dododex.com/taming/{slug}" if slug else "https://www.dododex.com/"
-            desc_lines = [
-                f"**Creature:** {creature_name}",
-                f"**Wild Level:** {lvl}",
-                f"**Server Rates:** Taming **{settings.taming_speed}x**, Food Drain **{settings.food_drain}x**",
-                "",
-                "⚠️ Calculator data failed to load right now, so here’s a quick link:",
-            ]
-            e = discord.Embed(title="🧮 Tame Calculation (Link Mode)", description="\n".join(desc_lines), color=0x3498DB)
-            e.add_field(name="Dododex", value=url, inline=False)
-            e.timestamp = datetime.utcnow()
-            await _send(embed=e)
+            await _send(content="❌ Taming data couldn't be loaded right now. Try again in a minute.")
             return
 
         creature_key = _resolve_creature_key(creature_name)
@@ -4013,13 +4356,123 @@ class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
         e.set_footer(text="Estimates use official wiki taming tables, adjusted by your server multipliers.")
         await _send(embed=e)
 
+
+class _BreedingCalcModal(discord.ui.Modal, title="Breeding Calculator"):
+    creature = discord.ui.TextInput(label="Creature (e.g. Rex)", placeholder="Rex", required=True, max_length=60)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        async def _send(*, content: Optional[str] = None, embed: Optional[discord.Embed] = None):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(content=content, embed=embed, ephemeral=True)
+                else:
+                    await interaction.response.send_message(content=content, embed=embed, ephemeral=True)
+            except Exception:
+                pass
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        settings = await calc_get_settings(interaction.guild_id)
+
+        ok = await ensure_breeding_data_loaded()
+        if not ok:
+            await _send(content="❌ Breeding data couldn't be loaded right now. Try again in a minute.")
+            return
+
+        creature_name = str(self.creature.value).strip()
+        key = _resolve_breeding_key(creature_name)
+        if not key:
+            await _send(content="❌ I couldn't find that creature in the breeding table. Try a simpler name (example: Rex, Raptor, Argentavis).")
+            return
+
+        try:
+            result = _compute_breeding(key, settings)
+        except Exception:
+            await _send(content="❌ I couldn't calculate that breeding entry.")
+            return
+
+        lines = [
+            f"**Creature:** {result['name']}",
+            "",
+            f"**Mating Interval:** "
+            + (
+                f"**{_format_hms(result['mating_min_adj_s'])} – {_format_hms(result['mating_max_adj_s'])}**"
+                if result['mating_min_adj_s'] and result['mating_max_adj_s']
+                else "N/A"
+            ),
+            f"**Incubation / Gestation:** **{_format_hms(result['incubation_adj_s'])}**",
+            f"**Baby → Adult:** **{_format_hms(result['maturation_adj_s'])}**",
+            "",
+            f"**Imprint Period:** **{_format_hms(result['imprint_period_s'])}** (base 8h × Cuddle Interval Mult)",
+            f"**Imprints Possible:** **{result['imprints_possible']}** (times shown below)",
+        ]
+
+        e = discord.Embed(title="🥚 Democracy Ark — Breeding Calculator", description="\n".join(lines), color=0xE67E22)
+        e.timestamp = datetime.utcnow()
+
+        if result["imprint_times_s"]:
+            e.add_field(
+                name="Imprint times after hatch/birth",
+                value="\n".join(f"• {i+1}: {_format_hms(t)}" for i, t in enumerate(result["imprint_times_s"])),
+                inline=False,
+            )
+            if result["imprints_possible"] > len(result["imprint_times_s"]):
+                e.add_field(name="…and more", value=f"(Showing first {len(result['imprint_times_s'])} of {result['imprints_possible']})", inline=False)
+
+        e.add_field(
+            name="Assumptions (multipliers)",
+            value=(
+                f"Mating Interval Mult: **{result['settings']['mating_interval_mult']}x**\n"
+                f"Egg Hatch Speed: **{result['settings']['egg_hatch_speed']}x**\n"
+                f"Baby Mature Speed: **{result['settings']['baby_mature_speed']}x**\n"
+                f"Cuddle Interval Mult: **{result['settings']['cuddle_interval_mult']}x**\n"
+                f"Imprint Amount Mult: **{result['settings']['imprint_amount_mult']}x** (affects % per imprint)"
+            ),
+            inline=False,
+        )
+
+        e.set_footer(text="Times sourced from official breeding tables, adjusted by your server multipliers.")
+        await _send(embed=e)
+
 class TameCalculatorView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Calculate", style=discord.ButtonStyle.success, custom_id="tame_calc:calculate")
-    async def calculate(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Tame", style=discord.ButtonStyle.success, custom_id="tame_calc:tame")
+    async def tame_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(_TameCalcModal())
+
+    @discord.ui.button(label="Breeding", style=discord.ButtonStyle.secondary, custom_id="tame_calc:breeding")
+    async def breed_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_BreedingCalcModal())
+
+    @discord.ui.button(label="Reload Data", style=discord.ButtonStyle.primary, custom_id="tame_calc:reload")
+    async def reload_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Staff-only: refresh cached wiki tables
+        if not interaction.guild or not isinstance(interaction.user, discord.Member) or not is_staff_member(interaction.user):
+            try:
+                await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        ok1 = await ensure_taming_data_loaded(force=True)
+        ok2 = await ensure_breeding_data_loaded(force=True)
+        try:
+            await ensure_tame_calculator_panel(interaction.guild)
+        except Exception:
+            pass
+        try:
+            await interaction.followup.send(f"✅ Reload complete. Taming: {'OK' if ok1 else 'FAIL'} • Breeding: {'OK' if ok2 else 'FAIL'}", ephemeral=True)
+        except Exception:
+            pass
+
 
 async def ensure_tame_calculator_panel(guild: discord.Guild) -> None:
     global _TAME_CALC_MESSAGE_ID_RUNTIME
