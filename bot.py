@@ -814,8 +814,8 @@ async def _restart_log(guild: discord.Guild, text: str) -> None:
     if isinstance(ch, discord.TextChannel):
         try:
             await ch.send(text)
-        except Exception:
-            pass
+        except Exception as e:
+            _panel_log(f"{message_id_runtime_name}: failed to fetch/edit message {current_id} in #{getattr(ch,'name','?')}", e)
 
 async def _nitrado_post_action(action_label: str, endpoint_suffixes: List[str]) -> Tuple[bool, str]:
     """
@@ -893,8 +893,8 @@ class RestartMessageModal(discord.ui.Modal, title="Restart Democracy Ark"):
         if not interaction.guild or not interaction.user:
             try:
                 await interaction.response.send_message("❌ Server context required.", ephemeral=True)
-            except Exception:
-                pass
+            except Exception as e:
+                _panel_log(f"{message_id_runtime_name}: posted panel but failed to pin in #{getattr(ch,'name','?')}", e)
             return
 
         msg = str(self.restart_message.value or "").strip()
@@ -1035,7 +1035,8 @@ async def _get_text_channel(guild: discord.Guild, channel_id_str: str) -> Option
     try:
         fetched = await bot.fetch_channel(int(channel_id_str))
         return fetched if isinstance(fetched, discord.TextChannel) else None
-    except Exception:
+    except Exception as e:
+        _panel_log(f"{message_id_runtime_name}: failed to send panel in #{getattr(ch,'name','?')}", e)
         return None
 
 async def nitrado_status_call():
@@ -1990,6 +1991,34 @@ class StarterKitPanelView(discord.ui.View):
             except Exception:
                 pass
 
+
+# -----------------------
+# Panel diagnostics / logging
+# -----------------------
+PANEL_DEBUG = os.getenv("PANEL_DEBUG", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+_LAST_PANEL_ERRORS: List[str] = []
+
+def _panel_log(context: str, exc: Optional[BaseException] = None) -> None:
+    """Log panel/posting issues to stdout so Railway shows the real reason panels didn't post."""
+    if not PANEL_DEBUG:
+        return
+    msg = f"[PANEL] {context}"
+    if exc is not None:
+        msg += f" | {repr(exc)}"
+    print(msg, flush=True)
+    if exc is not None:
+        try:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            print(tb, flush=True)
+        except Exception:
+            pass
+    try:
+        _LAST_PANEL_ERRORS.append(msg)
+        if len(_LAST_PANEL_ERRORS) > 25:
+            del _LAST_PANEL_ERRORS[:-25]
+    except Exception:
+        pass
+
 async def _ensure_panel_message(
     guild: discord.Guild,
     channel_id_str: str,
@@ -2032,7 +2061,8 @@ async def _ensure_panel_message(
                     try:
                         await m.edit(embed=embed, view=view)
                         return int(m.id)
-                    except Exception:
+                    except Exception as e:
+                        _panel_log(f"{message_id_runtime_name}: failed to edit pinned panel in #{getattr(ch,'name','?')}", e)
                         continue
         except Exception:
             pass
@@ -2046,7 +2076,8 @@ async def _ensure_panel_message(
                     try:
                         await m.edit(embed=embed, view=view)
                         return int(m.id)
-                    except Exception:
+                    except Exception as e:
+                        _panel_log(f"{message_id_runtime_name}: failed to edit recent panel in #{getattr(ch,'name','?')}", e)
                         continue
         except Exception:
             pass
@@ -3434,6 +3465,114 @@ async def on_member_join(member: discord.Member):
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong ✅", ephemeral=True)
+
+
+
+# -----------------------
+# ✅ Panel diagnostics (admin/staff)
+# -----------------------
+@bot.tree.command(name="paneldiagnose", description="Diagnose why module panels are not posting (shows missing perms/IDs).")
+async def paneldiagnose(interaction: discord.Interaction):
+    # Limit to staff/admin
+    if not _is_staff_member(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("❌ Run this inside the server.", ephemeral=True)
+        return
+
+    me = guild.me or guild.get_member(getattr(bot.user, "id", 0))
+    if me is None:
+        await interaction.response.send_message("❌ Couldn't resolve the bot member in this guild.", ephemeral=True)
+        return
+
+    checks = [
+        ("Server Status", "SERVER_STATUS_CHANNEL_ID", SERVER_STATUS_CHANNEL_ID),
+        ("Server Alerts", "SERVER_ALERTS_CHANNEL_ID", SERVER_ALERTS_CHANNEL_ID),
+        ("Server Control Panel", "SERVER_CONTROL_CHANNEL_ID", SERVER_CONTROL_CHANNEL_ID),
+        ("Starter Kit Panel", "CLAIM_CHANNEL_ID", CLAIM_CHANNEL_ID),
+        ("Starter Admin Panel", "STARTER_ADMIN_CHANNEL_ID", STARTER_ADMIN_CHANNEL_ID),
+        ("Poll Panel", "VOTE_CHANNEL_ID", VOTE_CHANNEL_ID),
+        ("Get Role Panel", "GET_ROLE_CHANNEL_ID", GET_ROLE_CHANNEL_ID),
+        ("Self Roles Panel", "SELF_ROLES_CHANNEL_ID", SELF_ROLES_CHANNEL_ID),
+        ("Role Manager Panel", "ROLE_MANAGER_CHANNEL_ID", ROLE_MANAGER_CHANNEL_ID),
+    ]
+
+    lines: List[str] = []
+    lines.append("**Panel Diagnose Report**")
+    lines.append(f"Bot: {me.mention} | Guild: **{guild.name}**")
+    lines.append("")
+
+    def _perm_flag(ok: bool) -> str:
+        return "✅" if ok else "❌"
+
+    for label, env_name, cid in checks:
+        if not cid or not str(cid).isdigit():
+            lines.append(f"• **{label}** — ❌ Missing/invalid `{env_name}`")
+            continue
+
+        ch = guild.get_channel(int(cid))
+        if ch is None:
+            lines.append(f"• **{label}** — ❌ `{env_name}` points to a channel I can't see (ID {cid})")
+            continue
+
+        perms = ch.permissions_for(me)
+        can_view = perms.view_channel
+        can_send = perms.send_messages
+        can_embed = perms.embed_links
+        can_read = perms.read_message_history
+
+        # Pinning is nice-to-have; not required
+        lines.append(
+            f"• **{label}** — "
+            f"{_perm_flag(can_view)} view, {_perm_flag(can_send)} send, {_perm_flag(can_embed)} embeds, {_perm_flag(can_read)} history "
+            f"(#{getattr(ch, 'name', 'unknown')})"
+        )
+
+    if _LAST_PANEL_ERRORS:
+        lines.append("")
+        lines.append("**Recent panel errors (Railway logs will include full tracebacks):**")
+        for e in _LAST_PANEL_ERRORS[-10:]:
+            lines.append(f"• {e}")
+
+    # Try to ensure panels again (non-fatal). This helps surface errors in logs.
+    try:
+        await ensure_server_control_panel(guild)
+        await ensure_starter_panel(guild)
+        await ensure_starter_admin_panel(guild)
+        await ensure_poll_panel(guild)
+        await ensure_get_role_panel(guild)
+        await ensure_self_roles_panel(guild)
+        await ensure_role_manager_panel(guild)
+    except Exception as e:
+        _panel_log("paneldiagnose: ensure panels raised", e)
+
+    out = "\n".join(lines)
+    # Discord limit
+    if len(out) > 1900:
+        out = out[:1900] + "\n…(truncated)"
+    await interaction.response.send_message(out, ephemeral=True)
+
+@bot.tree.command(name="showpanelids", description="Show the current runtime panel message IDs (copy to Railway variables).")
+async def showpanelids(interaction: discord.Interaction):
+    if not _is_staff_member(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    lines = [
+        "**Runtime Panel Message IDs** (copy these into Railway if needed)",
+        f"SERVER_STATUS_MESSAGE_ID: `{globals().get('_SERVER_STATUS_MESSAGE_ID_RUNTIME', 0) or 0}`",
+        f"SERVER_CONTROL_MESSAGE_ID: `{globals().get('_SERVER_CONTROL_MESSAGE_ID_RUNTIME', 0) or 0}`",
+        f"STARTER_PANEL_MESSAGE_ID: `{globals().get('_STARTER_PANEL_MESSAGE_ID_RUNTIME', 0) or 0}`",
+        f"STARTER_ADMIN_MESSAGE_ID: `{globals().get('_STARTER_ADMIN_MESSAGE_ID_RUNTIME', 0) or 0}`",
+        f"POLL_PANEL_MESSAGE_ID: `{globals().get('_POLL_PANEL_MESSAGE_ID_RUNTIME', 0) or 0}`",
+        f"GET_ROLE_PANEL_MESSAGE_ID: `{globals().get('_GET_ROLE_PANEL_MESSAGE_ID_RUNTIME', 0) or 0}`",
+        f"SELF_ROLES_MESSAGE_ID: `{globals().get('_SELF_ROLES_MESSAGE_ID_RUNTIME', 0) or 0}`",
+        f"ROLE_MANAGER_MESSAGE_ID: `{globals().get('_ROLE_MANAGER_MESSAGE_ID_RUNTIME', 0) or 0}`",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # -----------------------
 # ✅ Owners-only: restart Nitrado server
