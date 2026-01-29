@@ -612,6 +612,7 @@ class BoxPin:
 PINS_POOL: Dict[int, BoxPin] = {}
 # In-memory claims: user_id -> (box, pin)
 CLAIMS: Dict[int, Tuple[int, str]] = {}
+CLAIMED_USERS: Set[int] = set()  # user_ids who have EVER claimed (even if a vault is later recycled)
 
 # -----------------------
 # Helpers: permissions
@@ -1689,6 +1690,8 @@ class StarterKitPanelView(discord.ui.View):
         CLAIMS[uid] = (bp.box, bp.pin)
         await save_claims_only()
 
+            CLAIMED_USERS.add(uid)
+            await save_claimed_users_only()
         msg = (
             f"🎁 Starter kit claimed!\n"
             f"**Your box:** #{bp.box}\n"
@@ -2268,7 +2271,22 @@ class StarterVaultAdminView(discord.ui.View):
         super().__init__(timeout=None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return is_staff_member(interaction.user)
+        # If this returns False without responding, Discord shows "Interaction Failed".
+        if interaction.guild is None:
+            try:
+                await interaction.response.send_message("❌ This panel only works inside the server.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+
+        if not is_staff_member(interaction.user):
+            try:
+                await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+
+        return True
 
     def _render_starter_admin_box(self) -> str:
         avail = len(PINS_POOL)
@@ -2296,30 +2314,32 @@ class StarterVaultAdminView(discord.ui.View):
 
     @discord.ui.button(label="View Claims", style=discord.ButtonStyle.primary, custom_id="starter_admin_claims")
     async def view_claims(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
         if not CLAIMS:
-            return await interaction.response.send_message("No starter vault claims yet.", ephemeral=True)
+            await interaction.followup.send("No starter vault claims yet.", ephemeral=True)
+            return
 
         lines = []
-        # sort by vault number
-        for uid, (box_no, pin) in sorted(CLAIMS.items(), key=lambda kv: kv[1][0]):
-            name = str(uid)
-            if interaction.guild:
-                m = interaction.guild.get_member(uid)
-                if m:
-                    name = m.display_name
-            lines.append(f"- {name} — Vault #{box_no} — PIN {pin}")
-
+        for uid, (vault_id, pin) in CLAIMS.items():
+            m = interaction.guild.get_member(uid)
+            name = m.display_name if m else f"User {uid}"
+            lines.append(f"- {name} — Vault #{vault_id}")
         msg = "Starter vault claims:\n" + "\n".join(lines)
-        await interaction.response.send_message(f"```{msg}```", ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
 
     @discord.ui.button(label="Pool Count", style=discord.ButtonStyle.secondary, custom_id="starter_admin_poolcount")
     async def pool_count(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
         avail = len(PINS_POOL)
         claimed = len(CLAIMS)
-        await interaction.response.send_message(
-            f"Available vaults: **{avail}**\nClaimed vaults: **{claimed}**",
-            ephemeral=True,
-        )
+        await interaction.followup.send(f"Available vaults: {avail}\nClaimed vaults: {claimed}", ephemeral=True)
 
 async def ensure_starter_admin_panel(guild: discord.Guild) -> None:
     """
@@ -2575,6 +2595,12 @@ async def load_state() -> None:
     if DB_POOL is not None:
         PINS_POOL = await db_load_pins_pool()
         CLAIMS = await db_load_claims_state()
+        # Claimed users (ever claimed) live in DB so recycled vaults can't be re-claimed.
+        try:
+            async with DB_POOL.acquire() as con:
+                CLAIMED_USERS = await db_load_claimed_users(con)
+        except Exception as e:
+            print(f"STATE: failed to load CLAIMED_USERS from DB: {e}")
         # ✅ NEW: preload active polls so votes and results survive restarts
         try:
             polls = await db_load_active_polls()
@@ -2600,6 +2626,7 @@ async def load_state() -> None:
     # Fallback to CSV
     PINS_POOL = load_pins_pool()
     CLAIMS = load_claims_state()
+    CLAIMED_USERS = load_claimed_users_state()
 
 async def save_pool_state() -> None:
     if DB_POOL is not None:
@@ -2615,20 +2642,14 @@ async def save_claims_only() -> None:
 
 
 async def save_claimed_users_only() -> None:
+    """Persist CLAIMED_USERS.
+    - If using DB: claims are written via db_mark_user_claimed() at claim-time, so nothing to do here.
+    - If using CSV: write claimed_users.json so recycled vaults still block re-claim.
+    """
     global CLAIMED_USERS
-    if DATABASE_URL:
-        try:
-            async with db_pool.acquire() as con:
-                # We don't bulk-save here; claimed-users are written on claim via db_mark_user_claimed.
-                # Just keep the in-memory cache warm from DB if needed.
-                CLAIMED_USERS = await db_load_claimed_users(con)
-        except Exception:
-            pass
-    else:
-        try:
-            save_claimed_users_state(CLAIMED_USERS)
-        except Exception:
-            pass
+    if DATABASE_URL and DB_POOL:
+        return
+    save_claimed_users_state(CLAIMED_USERS)
 
 async def log_reset(admin_id: int, box: int, user_id: int, pin: str, reason: str = "") -> None:
     if DB_POOL is not None:
@@ -3131,7 +3152,7 @@ async def claimstarter(interaction: discord.Interaction):
     CLAIMED_USERS.add(uid)
     if DATABASE_URL:
         try:
-            async with db_pool.acquire() as con:
+            async with DB_POOL.acquire() as con:
                 await db_mark_user_claimed(con, uid, box=box, pin=pin)
         except Exception:
             pass
