@@ -3644,7 +3644,7 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
 
                 food_pieces = int(m.group(1))
                 seconds = _parse_mmss_or_hhmmss(m.group(2))
-payload = {
+                payload = {
                     "food_pieces": food_pieces,
                     "seconds": seconds,
                     "food_display": food_name,
