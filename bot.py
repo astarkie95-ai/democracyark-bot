@@ -1687,7 +1687,8 @@ async def _announce_status_change(guild: discord.Guild, old_raw: str, new_raw: s
     if not ch:
         return
 
-    ping = _build_server_ping(guild)
+    # Only ping on the first transition from ONLINE -> (RESTARTING/OFFLINE)
+    ping = _build_server_ping(guild) if (old_state == "🟢 ONLINE" and new_state in ("🟠 RESTARTING", "🔴 OFFLINE")) else ""
 
     # Special messaging for the common cases you care about
     if old_state == "🟢 ONLINE" and new_state in ("🟠 RESTARTING", "🔴 OFFLINE"):
