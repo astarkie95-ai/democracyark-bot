@@ -3376,7 +3376,7 @@ async def ensure_role_manager_panel(guild: discord.Guild) -> None:
 class CalcSettings:
     # Taming
     taming_speed: float = 5.0
-    food_drain: float = 1.0
+    food_drain: float = 0.8
     use_single_player_settings: bool = False
 
     # Breeding (ASA/ASE style multipliers)
@@ -3995,6 +3995,11 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
 
     food_affinity_eff = food_affinity * wake_aff_mult
     food_value_eff = food_value * wake_food_mult
+
+    # Kibble values from the wiki TamingTable are legacy/generic and under-estimate Dododex/ASA kibble affinity.
+    # Apply a small scaling so kibble counts align with Dododex (keeps all other foods untouched).
+    if food_key == "Kibble":
+        food_affinity_eff *= 3.25
 
     food_pieces = int(math.ceil(affinity_needed / food_affinity_eff))
 
