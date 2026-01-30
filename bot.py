@@ -4011,9 +4011,11 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
             seconds = int(math.ceil(food_pieces * abs(food_value_eff) / denom * food_drain_mult))
 
     # correction hacks used on wiki
+    # NOTE: Dododex-style timing does NOT apply the wiki's resultCorrection multiplier.
+    # Keeping this block as a no-op to preserve structure without affecting tame times.
     if c.get("resultCorrection") is not None:
         try:
-            seconds = int(float(seconds) * float(c.get("resultCorrection")))
+            seconds = int(float(seconds))
         except Exception:
             pass
 
