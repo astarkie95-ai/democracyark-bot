@@ -3962,7 +3962,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     # required affinity
     affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level - 1)
 
-    affinity_needed = affinity_needed / (taming_speed * 4.0)
+    affinity_needed = affinity_needed / taming_speed
     # pick food
     food_key = _pick_food(c, food_pref) or ""
     foodname_disp = food_key
@@ -4029,7 +4029,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
             seconds = int(math.ceil(first_bite_delay))
         else:
             # The wiki module's consumption values are per 0.5s tick; convert to real seconds.
-            interval = abs(food_value_eff) / denom * 0.5
+            interval = abs(food_value_eff) / denom
             seconds = int(math.ceil(first_bite_delay + max(0, food_pieces - 1) * interval))
 
     # correction hacks used on wiki
