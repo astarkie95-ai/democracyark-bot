@@ -1494,6 +1494,23 @@ async def nitrado_status_call():
                 _deep_find(gs, {"slots", "player_max", "players_max", "maxplayers", "max_players"}),
             )
 
+            # Some providers return players/slots as a combined string like "3/20". Parse if present.
+            try:
+                if isinstance(players, str) and "/" in players and (slots is None or isinstance(slots, str)):
+                    nums = re.findall(r"\d+", players)
+                    if len(nums) >= 2:
+                        players = nums[0]
+                        if slots is None:
+                            slots = nums[1]
+                if isinstance(slots, str) and "/" in slots and players is None:
+                    nums = re.findall(r"\d+", slots)
+                    if len(nums) >= 2:
+                        players = nums[0]
+                        slots = nums[1]
+            except Exception:
+                pass
+
+
             ip = _coalesce(
                 query.get("ip"),
                 query.get("ip_address"),
@@ -3702,21 +3719,6 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                 }
                 await browser.close()
                 await _dododex_cache_put(cache_key, payload)
-                return payload
-                await browser.close()
-                    return None
-
-                food_pieces = int(m.group(1))
-                seconds = _parse_mmss_or_hhmmss(m.group(2))
-payload = {
-                    "food_pieces": food_pieces,
-                    "seconds": seconds,
-                    "food_display": food_name,
-                    "source": "dododex_live",
-                    "url": url,
-                }
-                await _dododex_cache_put(cache_key, payload)
-                await browser.close()
                 return payload
         except Exception:
             return None
