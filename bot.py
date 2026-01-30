@@ -3424,7 +3424,7 @@ async def calc_get_settings(guild_id: int) -> CalcSettings:
                 return CalcSettings()
             return CalcSettings(
                 taming_speed=float(row["taming_speed"]) if row["taming_speed"] is not None else 5.0,
-                food_drain=float(row["food_drain"]) if row["food_drain"] is not None else 1.0,
+                food_drain=float(row["food_drain"]) if row["food_drain"] is not None else float(CalcSettings.food_drain),
                 use_single_player_settings=bool(row["use_single_player_settings"]) if row["use_single_player_settings"] is not None else False,
                 mating_interval_mult=float(row["mating_interval_mult"]) if row["mating_interval_mult"] is not None else 0.2,
                 egg_hatch_speed=float(row["egg_hatch_speed"]) if row["egg_hatch_speed"] is not None else 5.0,
@@ -3962,7 +3962,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     # required affinity
     affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level - 1)
 
-    affinity_needed = affinity_needed / (taming_speed * 4.0)
+    affinity_needed = affinity_needed / taming_speed
     # pick food
     food_key = _pick_food(c, food_pref) or ""
     foodname_disp = food_key
