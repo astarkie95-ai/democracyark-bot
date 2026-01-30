@@ -4004,11 +4004,12 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     else:
         base = float(c.get("foodConsumptionBase") or 0.0)
         mult = float(c.get("foodConsumptionMult") or 0.0)
-        denom = base * mult
+        denom = base * mult * food_drain_mult
         if denom <= 0:
             seconds = 0
         else:
-            seconds = int(math.ceil(food_pieces * abs(food_value_eff) / denom * food_drain_mult))
+            # The wiki module's consumption values are per 0.5s tick; convert to real seconds.
+            seconds = int(math.ceil(food_pieces * abs(food_value_eff) / denom * 0.5))
 
     # correction hacks used on wiki
     # NOTE: Dododex-style timing does NOT apply the wiki's resultCorrection multiplier.
