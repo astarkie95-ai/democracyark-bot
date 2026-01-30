@@ -3,3 +3,5 @@ Flask==3.1.2
 python-dotenv==1.0.1
 asyncpg==0.29.0
 aiohttp
+playwright==1.50.0
+
