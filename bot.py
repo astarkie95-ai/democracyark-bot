@@ -1471,9 +1471,17 @@ async def nitrado_status_call():
                 query.get("players_current"),
                 query.get("numplayers"),
                 query.get("num_players"),
+                query.get("playercount"),
+                query.get("player_count"),
+                query.get("players_online"),
+                query.get("playersonline"),
                 gs.get("players"),
                 gs.get("player_current"),
-                _deep_find(gs, {"players", "player_current", "players_current", "numplayers", "num_players"}),
+                gs.get("playercount"),
+                gs.get("player_count"),
+                gs.get("players_online"),
+                gs.get("playersonline"),
+                _deep_find(gs, {"players", "player_current", "players_current", "numplayers", "num_players", "playercount", "player_count", "players_online", "playersonline"}),
             )
             slots = _coalesce(
                 query.get("slots"),
@@ -3484,7 +3492,7 @@ def _dododex_slug(creature_key: str) -> str:
     return s
 
 def _dododex_cache_key(creature_slug: str, level: int, settings: CalcSettings, food_display: str) -> str:
-    return f"v2|{creature_slug}|lvl={int(level)}|taming={settings.taming_speed}|fooddrain={settings.food_drain}|sp={int(bool(settings.use_single_player_settings))}|food={food_display}"
+    return f"v3|{creature_slug}|lvl={int(level)}|taming={settings.taming_speed}|fooddrain={settings.food_drain}|sp={int(bool(settings.use_single_player_settings))}|food={food_display}"
 
 async def _dododex_cache_get(cache_key: str):
     if not DB_POOL:
@@ -3531,7 +3539,6 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
     """
     Fetch taming results from Dododex via headless browser automation.
     Returns: {food_pieces:int, seconds:int, food_display:str, source:str, url:str}
-    NOTE: We ONLY mark as Dododex source if we successfully extracted values from the Dododex taming results table.
     """
     if async_playwright is None:
         return None
@@ -3540,18 +3547,19 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
     if str(os.getenv("USE_DODODEX", "0")).strip() != "1":
         return None
 
+    dodo_debug = str(os.getenv("DODO_DEBUG", "0")).strip() == "1"
+
     creature_slug = _dododex_slug(creature_key)
     url = f"https://www.dododex.com/taming/{creature_slug}"
 
-    # Bump version to invalidate older bad parses
-    cache_key = "v4|" + _dododex_cache_key(creature_slug, level, settings, food_display)
+    cache_key = _dododex_cache_key(creature_slug, level, settings, food_display)
 
     # 14-day TTL
     ttl = 14 * 24 * 60 * 60
     cached = await _dododex_cache_get(cache_key)
     if cached and (int(time.time()) - int(cached["created_at"])) < ttl:
         payload = cached["payload"]
-        if isinstance(payload, dict) and payload.get("food_pieces") and payload.get("seconds"):
+        if isinstance(payload, dict):
             payload["source"] = "dododex_cache"
             payload.setdefault("url", url)
             return payload
@@ -3561,7 +3569,7 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
         cached2 = await _dododex_cache_get(cache_key)
         if cached2 and (int(time.time()) - int(cached2["created_at"])) < ttl:
             payload = cached2["payload"]
-            if isinstance(payload, dict) and payload.get("food_pieces") and payload.get("seconds"):
+            if isinstance(payload, dict):
                 payload["source"] = "dododex_cache"
                 payload.setdefault("url", url)
                 return payload
@@ -3570,129 +3578,139 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
                 page = await browser.new_page()
-                await page.goto(url, wait_until="networkidle", timeout=45000)
+                await page.goto(url, wait_until="networkidle", timeout=30000)
 
-                # --- Fill inputs (robust XPaths anchored on visible labels) ---
-                async def _fill_number(label_contains: str, value: str) -> None:
-                    loc = page.locator(
-                        f"xpath=(//*[self::label or self::div][contains(normalize-space(),'{label_contains}')]/following::input[@type='number'])[1]"
-                    )
-                    if await loc.count() == 0:
-                        loc = page.locator(
-                            f"xpath=(//*[contains(normalize-space(),'{label_contains}')]/following::input[@type='number'])[1]"
-                        )
-                    if await loc.count() == 0:
-                        return
-                    await loc.fill(value)
-                    try:
-                        await loc.press("Enter")
-                    except Exception:
-                        pass
+                # Inputs (robust XPaths anchored on visible labels; Dododex UI is client-rendered)
+                lvl_loc = page.locator("xpath=(//*[self::label or self::div][normalize-space()='Level']/following::input[@type='number'])[1]")
+                if await lvl_loc.count() == 0:
+                    lvl_loc = page.locator("xpath=(//*[normalize-space()='Level']/following::input[@type='number'])[1]")
+                await lvl_loc.fill(str(int(level)))
 
-                await _fill_number("Level", str(int(level)))
-                await _fill_number("Taming Speed", str(float(settings.taming_speed)))
-                await _fill_number("Food Drain Multiplier", str(float(settings.food_drain)))
+                ts_loc = page.locator("xpath=(//*[self::label or self::div][contains(normalize-space(),'Taming Speed')]/following::input[@type='number'])[1]")
+                if await ts_loc.count() == 0:
+                    ts_loc = page.locator("xpath=(//*[contains(normalize-space(),'Taming Speed')]/following::input[@type='number'])[1]")
+                await ts_loc.fill(str(float(settings.taming_speed)))
 
-                # --- Force toggles OFF unless you later add them as supported settings ---
-                # Single Player Settings OFF
+                fd_loc = page.locator("xpath=(//*[self::label or self::div][contains(normalize-space(),'Food Drain Multiplier')]/following::input[@type='number'])[1]")
+                if await fd_loc.count() == 0:
+                    fd_loc = page.locator("xpath=(//*[contains(normalize-space(),'Food Drain Multiplier')]/following::input[@type='number'])[1]")
+                await fd_loc.fill(str(float(settings.food_drain)))
+
+                # Nudge recalculation
+                try:
+                    await fd_loc.press("Enter")
+                except Exception:
+                    pass
+
+                # SP toggle
                 try:
                     sp_in = page.locator("xpath=(//*[contains(normalize-space(),'Use Single Player Settings')]/following::input[@type='checkbox'])[1]")
-                    if await sp_in.count() > 0 and await sp_in.is_checked():
+                    is_checked = await sp_in.is_checked()
+                    want = bool(settings.use_single_player_settings)
+                    if is_checked != want:
                         await sp_in.click()
                 except Exception:
                     pass
 
-                # Sanguine Elixir OFF
-                try:
-                    elx_in = page.locator("xpath=(//*[contains(normalize-space(),'Sanguine Elixir')]/following::input[@type='checkbox'])[1]")
-                    if await elx_in.count() > 0 and await elx_in.is_checked():
-                        await elx_in.click()
-                except Exception:
-                    pass
-
-                # Give the page time to recalculate
-                await page.wait_for_timeout(1800)
+                await page.wait_for_timeout(1200)
 
                 food_name = (food_display or "").strip()
                 if not food_name:
                     food_name = "Kibble"
 
-                # --- Locate the taming results table/container ---
-                container = None
-                for sel in [
-                    # container that includes headers QTY/MAX/TIME (most reliable)
-                    "xpath=(//*[contains(normalize-space(),'Taming') and contains(normalize-space(),'QTY') and contains(normalize-space(),'TIME')]/ancestor::div)[1]",
-                    "xpath=(//*[contains(normalize-space(),'Taming Food') and (contains(normalize-space(),'Max Time') or contains(normalize-space(),'TIME'))]/ancestor::div)[1]",
-                    "xpath=(//*[contains(normalize-space(),'Taming Food')]/ancestor::div)[1]",
-                ]:
+                # Ensure Elixir toggle OFF (best-effort)
+                try:
+                    el_in = page.locator("xpath=(//*[contains(normalize-space(),'Sanguine Elixir')]/following::input[@type='checkbox'])[1]")
+                    if await el_in.count() > 0 and await el_in.is_checked():
+                        await el_in.click()
+                except Exception:
+                    pass
+
+                await page.wait_for_timeout(1200)
+
+                food_name = (food_display or "").strip() or "Kibble"
+
+                # Find the results section that contains the QTY/TIME table headers
+                results_root = None
+                root_candidates = [
+                    "xpath=(//*[contains(normalize-space(),'QTY') and contains(normalize-space(),'TIME')]/ancestor::div)[1]",
+                    "xpath=(//*[contains(normalize-space(),'QTY')]/ancestor::div)[1]",
+                    "xpath=(//*[contains(normalize-space(),'Taming') and contains(normalize-space(),'QTY')]/ancestor::div)[1]",
+                ]
+                for sel in root_candidates:
                     try:
                         loc = page.locator(sel)
                         if await loc.count() > 0:
-                            container = loc.first
+                            results_root = loc.first
                             break
                     except Exception:
                         continue
 
-                # Fallback to body if we can't find the container
-                if container is None:
-                    container = page.locator("body")
+                if results_root is None:
+                    if dodo_debug:
+                        logger.warning(f"[Dododex] Could not locate results table for {creature_slug}.")
+                    await browser.close()
+                    return None
 
-                # --- Find the row for the requested food and parse QTY + TIME ---
-                row_text = ""
-                try:
-                    food_el = container.locator(f"xpath=.//*[contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{food_name.lower()}')][1]")
-                    if await food_el.count() > 0:
-                        # Prefer a table row if present, else nearest div "row"
-                        tr = food_el.locator("xpath=ancestor::tr[1]")
-                        if await tr.count() > 0:
-                            row_text = await tr.inner_text()
-                        else:
-                            # heuristic: climb a few levels to capture the "row" text
-                            row_text = await food_el.locator("xpath=ancestor::*[self::div][1]").inner_text()
-                except Exception:
-                    row_text = ""
+                # Locate the row that contains the chosen food
+                row_loc = results_root.locator(f"xpath=.//*[contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{food_name.lower()}')]/ancestor::*[self::div or self::tr][1]")
+                if await row_loc.count() == 0:
+                    # fallback: search whole page but still parse row text only
+                    row_loc = page.locator(f"xpath=(//*[contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{food_name.lower()}')]/ancestor::*[self::div or self::tr][1])[1]")
 
-                if not row_text:
-                    # Last resort: search container text but constrain to the line containing the food name
-                    try:
-                        txt = await container.inner_text()
-                    except Exception:
-                        txt = await page.inner_text("body")
-                    # normalize whitespace but keep separators
-                    lines = [re.sub(r"\s+", " ", ln).strip() for ln in txt.splitlines() if ln.strip()]
-                    for ln in lines:
-                        if food_name.lower() in ln.lower():
-                            row_text = ln
-                            break
+                if await row_loc.count() == 0:
+                    if dodo_debug:
+                        logger.warning(f"[Dododex] No row found for food '{food_name}' on {url}")
+                    await browser.close()
+                    return None
 
-                row_text = re.sub(r"\s+", " ", (row_text or "")).strip()
+                row_text = (await row_loc.first.inner_text()).strip()
+                # Row should contain something like: "Superior Kibble 3 3 11:31"
+                # We want QTY (first int after name) and TIME (last mm:ss)
+                mmss = re.findall(r"\b\d{1,2}:\d{2}\b", row_text)
+                ints = re.findall(r"\b(\d{1,4})\b", row_text)
 
-                # Parse:
-                # Expected row contains something like:
-                # "Superior Kibble 3 3 11:31" (QTY, MAX, TIME)
-                # We take the first integer after the food name as QTY, and the LAST time token in the row as TIME.
-                qty = None
-                seconds = None
+                if dodo_debug:
+                    logger.info(f"[Dododex] row_text={row_text!r} mmss={mmss} ints={ints} url={url}")
 
-                # Find substring after food name to avoid catching other numbers before it
-                i = row_text.lower().find(food_name.lower())
-                tail = row_text[i + len(food_name):] if i >= 0 else row_text
+                if not mmss or len(ints) < 1:
+                    await browser.close()
+                    return None
 
-                int_m = re.search(r"\b(\d+)\b", tail)
-                if int_m:
-                    qty = int(int_m.group(1))
+                # TIME column is the rightmost mm:ss on the row
+                time_str = mmss[-1]
+                seconds = _parse_mmss_or_hhmmss(time_str)
 
-                times = re.findall(r"\b\d+:\d{2}(?::\d{2})?\b", row_text)
-                if times:
-                    seconds = _parse_mmss_or_hhmmss(times[-1])
+                # QTY is typically the first integer after the food name; take the first small-ish int
+                food_pieces = 0
+                for n in ints:
+                    v = int(n)
+                    if 0 < v < 500:
+                        food_pieces = v
+                        break
 
-                if not qty or not seconds:
+                if food_pieces <= 0 or seconds <= 0:
                     await browser.close()
                     return None
 
                 payload = {
-                    "food_pieces": int(qty),
+                    "food_pieces": int(food_pieces),
                     "seconds": int(seconds),
+                    "food_display": food_name,
+                    "source": "dododex_live",
+                    "url": url,
+                }
+                await browser.close()
+                await _dododex_cache_put(cache_key, payload)
+                return payload
+                await browser.close()
+                    return None
+
+                food_pieces = int(m.group(1))
+                seconds = _parse_mmss_or_hhmmss(m.group(2))
+payload = {
+                    "food_pieces": food_pieces,
+                    "seconds": seconds,
                     "food_display": food_name,
                     "source": "dododex_live",
                     "url": url,
@@ -3702,8 +3720,6 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                 return payload
         except Exception:
             return None
-
-
 async def calc_set_settings(guild_id: int, settings: CalcSettings) -> None:
     if not DB_POOL:
         return
@@ -5375,13 +5391,21 @@ async def run_tame_calculation(interaction: discord.Interaction):
         if narco_lines:
             e.add_field(name="Torpor Sustain (estimate)", value="\n".join(narco_lines), inline=False)
 
+        note_line = "Note: Results are computed from ARK Wiki tables; if you use Single Player Settings or custom food drain, update staff settings."
+        if isinstance(dodo, dict) and str(dodo.get("source","")).startswith("dododex_"):
+            note_line = "Note: Food/time from Dododex; KO/narco estimates are from ARK Wiki tables. If you use Single Player Settings or custom food drain, update staff settings."
+            try:
+                e.add_field(name="Dododex Source", value=f"{dodo.get('source')}\n{dodo.get('url', '')}", inline=False)
+            except Exception:
+                pass
+
         e.add_field(
             name="Assumptions",
             value=(
                 f"• Taming Speed: **{settings.taming_speed}x**\n"
                 f"• Food Drain: **{settings.food_drain}x**\n"
                 f"• Weapon Damage: **{wdmg}%**\n"
-                "Note: Results are computed from ARK Wiki tables; if you use Single Player Settings or custom food drain, update staff settings."
+                + note_line
             ),
             inline=False,
         )
@@ -6631,7 +6655,7 @@ TICKET_TYPES = [
     ("bug", "Bug"),
     ("report", "Report / Griefing"),
     ("appeal", "Appeal"),
-    ("suggestion", "Suggestion"),
+    ("suggestion", "Railway Request"),
 ]
 
 TICKET_PRIORITIES = ["low", "normal", "high", "urgent"]
@@ -7253,14 +7277,18 @@ async def ticket_transcript_action(interaction: discord.Interaction) -> None:
     embed.add_field(name="Messages", value=str(count), inline=True)
     embed.add_field(name="Requested by", value=f"{interaction.user} (`{interaction.user.id}`)" if interaction.user else "Unknown", inline=False)
 
-    await _log_ticket_event(interaction.guild, "", embed=embed)
+    posted = False  # ensure we only claim success if a log post actually happens
     if _is_digit_id(TICKET_LOG_CHANNEL_ID):
         logch = interaction.guild.get_channel(int(TICKET_LOG_CHANNEL_ID))
         if isinstance(logch, discord.TextChannel):
             try:
-                await logch.send(file=file)
+                await logch.send(embed=embed, file=file)
+                posted = True
             except Exception:
                 pass
+
+    if not posted:
+        await _log_ticket_event(interaction.guild, "", embed=embed)
 
     await _append_ticket_event(int(t["id"]), int(interaction.user.id), "transcript", f"messages={count}")
 
