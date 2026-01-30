@@ -5,7 +5,14 @@ import traceback
 import io
 import re
 import random
+import json
 import math
+
+# --- Dododex headless fetch (optional) ---
+try:
+    from playwright.async_api import async_playwright  # type: ignore
+except Exception:
+    async_playwright = None
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -712,6 +719,16 @@ async def db_init() -> None:
                     updated_at BIGINT NOT NULL DEFAULT 0
                 );
             """)
+
+            # ✅ NEW: Dododex results cache (optional; used only if USE_DODODEX=1)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS dododex_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    created_at BIGINT NOT NULL
+                );
+            """)
+
 
             # ✅ NEW: calc_settings migrations (safe on existing DB)
             try:
@@ -3435,6 +3452,175 @@ async def calc_get_settings(guild_id: int) -> CalcSettings:
     except Exception:
         return CalcSettings()
 
+
+# ---------------------------------------------------------------------------
+# Dododex headless fetch + cache (optional)
+# Enable by setting Railway env var USE_DODODEX=1 AND installing Playwright deps.
+# ---------------------------------------------------------------------------
+
+_DODODEX_LOCK = asyncio.Lock()
+
+_DODODEX_SLUG_OVERRIDES = {
+    "Argentavis": "argentavis",
+    "Rex": "rex",
+    "Giganotosaurus": "giganotosaurus",
+    "Therizinosaurus": "therizinosaurus",
+    "Rock Drake": "rockdrake",
+    "Thylacoleo": "thylacoleo",
+    "Yutyrannus": "yutyrannus",
+    "Tapejara": "tapejara",
+    "Dire Bear": "direbear",
+    "Direwolf": "direwolf",
+    "Woolly Rhino": "woollyrhino",
+}
+
+def _dododex_slug(creature_key: str) -> str:
+    ck = (creature_key or "").strip()
+    if ck in _DODODEX_SLUG_OVERRIDES:
+        return _DODODEX_SLUG_OVERRIDES[ck]
+    s = ck.lower()
+    s = re.sub(r"[^a-z0-9\s-]", "", s)
+    s = s.replace(" ", "")
+    return s
+
+def _dododex_cache_key(creature_slug: str, level: int, settings: CalcSettings, food_display: str) -> str:
+    return f"{creature_slug}|lvl={int(level)}|taming={settings.taming_speed}|fooddrain={settings.food_drain}|sp={int(bool(settings.use_single_player_settings))}|food={food_display}"
+
+async def _dododex_cache_get(cache_key: str):
+    if not DB_POOL:
+        return None
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT payload, created_at FROM dododex_cache WHERE cache_key=$1",
+            cache_key,
+        )
+        if not row:
+            return None
+        return {"payload": row["payload"], "created_at": int(row["created_at"] or 0)}
+
+async def _dododex_cache_put(cache_key: str, payload: dict):
+    if not DB_POOL:
+        return
+    now = int(time.time())
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO dododex_cache (cache_key, payload, created_at)
+            VALUES ($1, $2::jsonb, $3)
+            ON CONFLICT (cache_key) DO UPDATE
+            SET payload=EXCLUDED.payload, created_at=EXCLUDED.created_at
+            """,
+            cache_key,
+            json.dumps(payload),
+            now,
+        )
+
+def _parse_mmss_or_hhmmss(s: str) -> int:
+    s = (s or "").strip()
+    m = re.match(r"^(\d+):(\d{2})(?::(\d{2}))?$", s)
+    if not m:
+        return 0
+    a = int(m.group(1))
+    b = int(m.group(2))
+    c = int(m.group(3) or 0)
+    if m.group(3) is None:
+        return a * 60 + b
+    return a * 3600 + b * 60 + c
+
+async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSettings, food_display: str) -> dict | None:
+    """
+    Fetch taming results from Dododex via headless browser automation.
+    Returns: {food_pieces:int, seconds:int, food_display:str, source:str, url:str}
+    """
+    if async_playwright is None:
+        return None
+
+    # Feature flag
+    if str(os.getenv("USE_DODODEX", "0")).strip() != "1":
+        return None
+
+    creature_slug = _dododex_slug(creature_key)
+    url = f"https://www.dododex.com/taming/{creature_slug}"
+
+    cache_key = _dododex_cache_key(creature_slug, level, settings, food_display)
+
+    # 14-day TTL
+    ttl = 14 * 24 * 60 * 60
+    cached = await _dododex_cache_get(cache_key)
+    if cached and (int(time.time()) - int(cached["created_at"])) < ttl:
+        payload = cached["payload"]
+        if isinstance(payload, dict):
+            payload["source"] = "dododex_cache"
+            payload.setdefault("url", url)
+            return payload
+
+    async with _DODODEX_LOCK:
+        # re-check after waiting
+        cached2 = await _dododex_cache_get(cache_key)
+        if cached2 and (int(time.time()) - int(cached2["created_at"])) < ttl:
+            payload = cached2["payload"]
+            if isinstance(payload, dict):
+                payload["source"] = "dododex_cache"
+                payload.setdefault("url", url)
+                return payload
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+                page = await browser.new_page()
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+
+                # Inputs (best-effort XPaths anchored on visible labels)
+                await page.locator("xpath=//*[normalize-space()='Level']/following::input[1]").fill(str(int(level)))
+                await page.locator("xpath=//*[normalize-space()='Taming Speed']/following::input[1]").fill(str(float(settings.taming_speed)))
+                await page.locator("xpath=//*[contains(normalize-space(),'Food Drain Multiplier')]/following::input[1]").fill(str(float(settings.food_drain)))
+
+                # SP toggle
+                try:
+                    sp_in = page.locator("xpath=//*[contains(normalize-space(),'Use Single Player Settings')]/following::input[1]")
+                    is_checked = await sp_in.is_checked()
+                    want = bool(settings.use_single_player_settings)
+                    if is_checked != want:
+                        await sp_in.click()
+                except Exception:
+                    pass
+
+                await page.wait_for_timeout(1500)
+
+                food_name = (food_display or "").strip()
+                if not food_name:
+                    food_name = "Kibble"
+
+                # Use full body text (more stable than relying on classes)
+                full_text = await page.inner_text("body")
+                full_text = re.sub(r"\s+", " ", full_text)
+
+                # Patterns: "FoodName 4 13:32" or "4 FoodName 13:32"
+                pat = re.compile(rf"{re.escape(food_name)}\s+(\d+)\s+(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
+                m = pat.search(full_text)
+                if not m:
+                    pat2 = re.compile(rf"(\d+)\s+{re.escape(food_name)}\s+(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
+                    m = pat2.search(full_text)
+
+                if not m:
+                    await browser.close()
+                    return None
+
+                food_pieces = int(m.group(1))
+                seconds = _parse_mmss_or_hhmmss(m.group(2))
+
+                payload = {
+                    "food_pieces": food_pieces,
+                    "seconds": seconds,
+                    "food_display": food_name,
+                    "source": "dododex_live",
+                    "url": url,
+                }
+                await _dododex_cache_put(cache_key, payload)
+                await browser.close()
+                return payload
+        except Exception:
+            return None
 async def calc_set_settings(guild_id: int, settings: CalcSettings) -> None:
     if not DB_POOL:
         return
@@ -3962,7 +4148,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     # required affinity
     affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level - 1)
 
-    affinity_needed = affinity_needed / taming_speed
+    affinity_needed = affinity_needed / (taming_speed * 4.0)
     # pick food
     food_key = _pick_food(c, food_pref) or ""
     foodname_disp = food_key
@@ -4029,7 +4215,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
             seconds = int(math.ceil(first_bite_delay))
         else:
             # The wiki module's consumption values are per 0.5s tick; convert to real seconds.
-            interval = abs(food_value_eff) / denom
+            interval = abs(food_value_eff) / denom * 0.5
             seconds = int(math.ceil(first_bite_delay + max(0, food_pieces - 1) * interval))
 
     # correction hacks used on wiki
@@ -5055,11 +5241,23 @@ async def run_tame_calculation(interaction: discord.Interaction):
 
     weapon_text = _weapon_label(weapon)
     try:
+        dodo = None
+        try:
+            # Optional: fetch food/time from Dododex (headless browser) if enabled.
+            dodo = await dododex_fetch_taming(creature, int(level), settings, str(food))
+        except Exception:
+            dodo = None
+
         res = _compute_taming(creature, int(level), settings, food, weapon_text, wdmg)
 
         seconds = int(res.get("seconds") or 0)
         food_pieces = int(res.get("food_pieces") or 0)
         food_disp = res.get("food_display") or res.get("food_key") or "Food"
+
+        if isinstance(dodo, dict):
+            seconds = int(dodo.get("seconds") or seconds)
+            food_pieces = int(dodo.get("food_pieces") or food_pieces)
+            food_disp = dodo.get("food_display") or food_disp
         time_disp = _fmt_seconds(seconds) if seconds > 0 else "—"
 
         torpor = res.get("torpor") or {}
@@ -5081,6 +5279,12 @@ async def run_tame_calculation(interaction: discord.Interaction):
         )
         e.add_field(name="Total Tame Time", value=time_disp, inline=True)
         e.add_field(name="Food Needed", value=f"**{food_pieces}x** {food_disp}", inline=True)
+
+        if isinstance(dodo, dict):
+            src = dodo.get("source") or "dododex"
+            url = dodo.get("url") or ""
+            note = f"✅ Food & time pulled from Dododex ({src})." + (f"\n{url}" if url else "")
+            e.add_field(name="Dododex", value=note, inline=False)
 
         if ko_lines:
             e.add_field(name="KO Estimate", value="\n".join(ko_lines), inline=False)
