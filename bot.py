@@ -3484,7 +3484,7 @@ def _dododex_slug(creature_key: str) -> str:
     return s
 
 def _dododex_cache_key(creature_slug: str, level: int, settings: CalcSettings, food_display: str) -> str:
-    return f"{creature_slug}|lvl={int(level)}|taming={settings.taming_speed}|fooddrain={settings.food_drain}|sp={int(bool(settings.use_single_player_settings))}|food={food_display}"
+    return f"v2|{creature_slug}|lvl={int(level)}|taming={settings.taming_speed}|fooddrain={settings.food_drain}|sp={int(bool(settings.use_single_player_settings))}|food={food_display}"
 
 async def _dododex_cache_get(cache_key: str):
     if not DB_POOL:
@@ -3570,14 +3570,31 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                 page = await browser.new_page()
                 await page.goto(url, wait_until="networkidle", timeout=30000)
 
-                # Inputs (best-effort XPaths anchored on visible labels)
-                await page.locator("xpath=//*[normalize-space()='Level']/following::input[1]").fill(str(int(level)))
-                await page.locator("xpath=//*[normalize-space()='Taming Speed']/following::input[1]").fill(str(float(settings.taming_speed)))
-                await page.locator("xpath=//*[contains(normalize-space(),'Food Drain Multiplier')]/following::input[1]").fill(str(float(settings.food_drain)))
+                # Inputs (robust XPaths anchored on visible labels; Dododex UI is client-rendered)
+                lvl_loc = page.locator("xpath=(//*[self::label or self::div][normalize-space()='Level']/following::input[@type='number'])[1]")
+                if await lvl_loc.count() == 0:
+                    lvl_loc = page.locator("xpath=(//*[normalize-space()='Level']/following::input[@type='number'])[1]")
+                await lvl_loc.fill(str(int(level)))
+
+                ts_loc = page.locator("xpath=(//*[self::label or self::div][contains(normalize-space(),'Taming Speed')]/following::input[@type='number'])[1]")
+                if await ts_loc.count() == 0:
+                    ts_loc = page.locator("xpath=(//*[contains(normalize-space(),'Taming Speed')]/following::input[@type='number'])[1]")
+                await ts_loc.fill(str(float(settings.taming_speed)))
+
+                fd_loc = page.locator("xpath=(//*[self::label or self::div][contains(normalize-space(),'Food Drain Multiplier')]/following::input[@type='number'])[1]")
+                if await fd_loc.count() == 0:
+                    fd_loc = page.locator("xpath=(//*[contains(normalize-space(),'Food Drain Multiplier')]/following::input[@type='number'])[1]")
+                await fd_loc.fill(str(float(settings.food_drain)))
+
+                # Nudge recalculation
+                try:
+                    await fd_loc.press("Enter")
+                except Exception:
+                    pass
 
                 # SP toggle
                 try:
-                    sp_in = page.locator("xpath=//*[contains(normalize-space(),'Use Single Player Settings')]/following::input[1]")
+                    sp_in = page.locator("xpath=(//*[contains(normalize-space(),'Use Single Player Settings')]/following::input[@type='checkbox'])[1]")
                     is_checked = await sp_in.is_checked()
                     want = bool(settings.use_single_player_settings)
                     if is_checked != want:
@@ -3585,22 +3602,41 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                 except Exception:
                     pass
 
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1200)
 
                 food_name = (food_display or "").strip()
                 if not food_name:
                     food_name = "Kibble"
 
-                # Use full body text (more stable than relying on classes)
-                full_text = await page.inner_text("body")
-                full_text = re.sub(r"\s+", " ", full_text)
+                # Extract ONLY the taming results section (avoid false matches elsewhere on the page)
+                results_text = ""
+                candidates = [
+                    "xpath=(//*[contains(normalize-space(),'Taming Food') and (contains(normalize-space(),'Max Time') or contains(normalize-space(),'Time'))]/ancestor::div)[1]",
+                    "xpath=(//*[contains(normalize-space(),'Taming Food')]/ancestor::div)[1]",
+                ]
+                for sel in candidates:
+                    try:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0:
+                            results_text = await loc.first.inner_text()
+                            break
+                    except Exception:
+                        continue
+                if not results_text:
+                    # fallback: smaller scope than full body
+                    try:
+                        results_text = await page.locator("xpath=//*[contains(normalize-space(),'Taming Food')]/ancestor-or-self::*[1]").inner_text()
+                    except Exception:
+                        results_text = await page.inner_text("body")
+
+                results_text = re.sub(r"\s+", " ", results_text)
 
                 # Patterns: "FoodName 4 13:32" or "4 FoodName 13:32"
                 pat = re.compile(rf"{re.escape(food_name)}\s+(\d+)\s+(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
-                m = pat.search(full_text)
+                m = pat.search(results_text)
                 if not m:
                     pat2 = re.compile(rf"(\d+)\s+{re.escape(food_name)}\s+(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
-                    m = pat2.search(full_text)
+                    m = pat2.search(results_text)
 
                 if not m:
                     await browser.close()
@@ -3608,8 +3644,7 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
 
                 food_pieces = int(m.group(1))
                 seconds = _parse_mmss_or_hhmmss(m.group(2))
-
-                payload = {
+payload = {
                     "food_pieces": food_pieces,
                     "seconds": seconds,
                     "food_display": food_name,
