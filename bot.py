@@ -3962,7 +3962,7 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     # required affinity
     affinity_needed = float(c.get("affinityNeeded0", 0)) + float(c.get("affinityIncrease", 0)) * float(level - 1)
 
-    affinity_needed = affinity_needed / taming_speed
+    affinity_needed = affinity_needed / (taming_speed * 4.0)
     # pick food
     food_key = _pick_food(c, food_pref) or ""
     foodname_disp = food_key
