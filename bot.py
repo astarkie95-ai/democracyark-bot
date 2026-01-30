@@ -259,7 +259,7 @@ def poll_embed(poll: PollState) -> discord.Embed:
         pct = (c / total * 100.0) if total else 0.0
         desc_lines.append(f"**{i+1}. {opt}** — {c} ({pct:.0f}%)")
     status = "🔒 CLOSED" if poll.ended else "🗳️ OPEN"
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="📊 Server Poll",
         description="\n".join(desc_lines),
@@ -1594,7 +1594,7 @@ def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
         "```"
     )
 
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="📡 Democracy Bot — Nitrado Server Status",
         color=0x2ECC71,
@@ -1633,7 +1633,7 @@ async def _ensure_status_message(guild: discord.Guild) -> Optional[discord.Messa
 
     # create new module message
     try:
-        msg = await ch.send(embed=discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+        msg = await ch.send(embed=discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     title="📡 Democracy Bot — Starting up…"))
         _STATUS_MESSAGE_ID_RUNTIME = msg.id
         print(f"[NITRADO] New SERVER_STATUS_MESSAGE_ID = {msg.id} (save this in Railway Variables)", flush=True)
@@ -1650,7 +1650,7 @@ async def _announce_restart(guild: discord.Guild, message: str, requester: Optio
 
     ping = _build_server_ping(guild)
 
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🔁 Server Restart",
         description=(message or "Restarting soon — please log out safely!"),
@@ -1724,7 +1724,7 @@ async def nitrado_status_loop():
         msg = await _ensure_status_message(guild)
         if msg:
             await msg.edit(
-                embed=discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+                embed=discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
                     title="📡 Democracy Bot — Nitrado Server Status",
                     color=0x2ECC71,
@@ -1937,7 +1937,7 @@ def _build_control_panel_embed() -> discord.Embed:
         "A confirmation step prevents misclicks.\n"
         "```"
     )
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🛠 Democracy Bot — Server Control Panel",
         color=0xE67E22,
@@ -2126,7 +2126,7 @@ async def _announce_server_action(guild: discord.Guild, action: str, message: st
         "restart": "🔁 Server Restart",
     }.get(action, "🛠 Server Action")
 
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title=title,
         description=(message or "Server action incoming."),
@@ -2207,7 +2207,7 @@ def _build_starter_panel_embed() -> discord.Embed:
         "",
         "Press **Claim Starter Kit** to receive your vault PIN privately.",
     ]
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🎁 Democracy Bot — Starter Kit Module",
         description=_module_box("STARTER KIT MODULE", lines),
@@ -2473,7 +2473,7 @@ def _build_poll_panel_embed(active: Optional["PollState"] = None) -> discord.Emb
             "Players vote in the vote channel when a poll is posted.",
         ]
 
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="📊 Democracy Bot — Poll Module",
         description=_module_box("POLL MODULE", lines),
@@ -2975,7 +2975,7 @@ async def ensure_starter_admin_panel(guild: discord.Guild) -> None:
     if not _is_digit_id(ch_id):
         return
 
-    embed = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    embed = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="Democracy Bot — Starter Vault Admin",
         description=_render_starter_admin_box(),
@@ -3064,7 +3064,7 @@ def _build_get_role_embed(guild: discord.Guild) -> discord.Embed:
         "",
         "If you need help first, open a ticket in **#open-a-ticket**.",
     ]
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🧬 Democracy Bot — Get Roles",
         description=_module_box("GET ROLE", lines),
@@ -3086,7 +3086,7 @@ def _build_role_manager_embed(guild: discord.Guild) -> discord.Embed:
         "• Remove Role — remove from list",
         "• List Roles — view configured roles",
     ]
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🧩 Democracy Bot — Role Manager (Staff)",
         description=_module_box("ROLE MANAGER", lines),
@@ -3303,7 +3303,7 @@ def _build_self_roles_embed() -> discord.Embed:
             lines.append(f"• {label}{d}")
         if len(SELF_ROLES) > 20:
             lines.append("…and more (limit 20 buttons per panel).")
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🏷️ Democracy Bot — Self Roles",
         description=_module_box("SELF ROLES", lines),
@@ -3800,7 +3800,7 @@ def _build_tame_calc_embed(guild: discord.Guild, settings: CalcSettings) -> disc
         "",
         "Use **Tame** or **Breeding** below to calculate in Discord (no external links).",
     ]
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🦖 Democracy Ark — Tame Calculator",
         description=_module_box("TAME CALCULATOR", lines),
@@ -3825,7 +3825,7 @@ def _build_calc_settings_embed(guild: discord.Guild, settings: CalcSettings) -> 
         "Staff: update these so the public calculator panel stays accurate.",
         "(Uses DB if available; otherwise defaults are used.)",
     ]
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="⚙️ Democracy Bot — Calculator Settings (Staff)",
         description=_module_box("CALC SETTINGS", lines),
@@ -4790,7 +4790,7 @@ class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
             f"**Estimated Time:** **{_format_hms(result['seconds'])}**",
         ]
 
-        e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+        e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     title="🦖 Democracy Ark — Tame Calculator", description="\n".join(lines), color=0x2ECC71)
         e.timestamp = datetime.utcnow()
 
@@ -4877,7 +4877,7 @@ class _BreedingCalcModal(discord.ui.Modal, title="Breeding Calculator"):
             f"**Imprints Possible:** **{result['imprints_possible']}** (times shown below)",
         ]
 
-        e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+        e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     title="🥚 Democracy Ark — Breeding Calculator", description="\n".join(lines), color=0xE67E22)
         e.timestamp = datetime.utcnow()
 
@@ -5288,7 +5288,7 @@ async def start_tame_calculator_flow(interaction: discord.Interaction, edit: boo
         "Press **Calculate** when ready.",
     ]
 
-    embed = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    embed = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🧮 Tame Calculator (Dropdown Mode)",
         description="\n".join(summary_lines),
@@ -5392,7 +5392,7 @@ async def run_tame_calculation(interaction: discord.Interaction):
             if (torpor.get("bio_toxin") or 0) > 0:
                 narco_lines.append(f"• Bio Toxin: **{int(torpor.get('bio_toxin'))}**")
 
-        e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+        e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
             title=f"🦖 Tame Result — {creature} (Lv {level})",
             color=0x2ECC71,
@@ -5499,7 +5499,7 @@ async def start_breeding_calculator_flow(interaction: discord.Interaction, edit:
         "",
         "Press **Calculate Breeding** to get mating, incubation, maturation, and imprint schedule.",
     ]
-    embed = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    embed = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     title="🥚 Breeding Calculator (Dropdown Mode)", description="\n".join(summary), color=0x3498DB)
 
     # We reuse select classes but store into b_* keys
@@ -5559,7 +5559,7 @@ async def run_breeding_calculation(interaction: discord.Interaction):
                 return _fmt_seconds(a_s)
             return f"{_fmt_seconds(a_s)} – {_fmt_seconds(b_s)}"
 
-        e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+        e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     title=f"🥚 Breeding — {res.get('name') or creature}", color=0x3498DB)
 
         e.add_field(name="Mating Interval", value=_rng(int(res.get("mating_min_adj_s") or 0), int(res.get("mating_max_adj_s") or 0)), inline=False)
@@ -6109,7 +6109,7 @@ async def serverpanel(interaction: discord.Interaction):
         return
 
     view = ServerControlView(requester_id=interaction.user.id)
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🛠 Democracy Bot — Server Control Panel",
         color=0xE67E22,
@@ -6823,7 +6823,7 @@ async def _create_ticket_channel(
 
 async def _ticket_intro_message(channel: discord.TextChannel, owner: discord.Member, ticket_id: int, ticket_type: str, subject: str, details: str):
     pretty_type = dict(TICKET_TYPES).get(ticket_type, ticket_type)
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title=f"🎫 Ticket #{ticket_id} — {pretty_type}",
         description="A staff member will respond as soon as possible.",
@@ -7003,7 +7003,7 @@ async def create_ticket_flow(interaction: discord.Interaction, ticket_type: str,
     await _ticket_intro_message(channel, user, ticket_id, ticket_type, subject, details)
 
     # Log
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     title=f"🎫 Ticket #{ticket_id} created", description=f"{channel.mention}")
     e.add_field(name="Owner", value=f"{user.mention} (`{user.id}`)", inline=False)
     e.add_field(name="Type", value=str(ticket_type), inline=True)
@@ -7299,7 +7299,7 @@ async def ticket_transcript_action(interaction: discord.Interaction) -> None:
     file = discord.File(buf, filename=filename)
 
     # Send to log channel
-    embed = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    embed = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     title=f"🧾 Transcript for Ticket #{int(t['id'])}", description=f"Channel: {interaction.channel.mention}")
     embed.add_field(name="Messages", value=str(count), inline=True)
     embed.add_field(name="Requested by", value=f"{interaction.user} (`{interaction.user.id}`)" if interaction.user else "Unknown", inline=False)
@@ -7382,7 +7382,7 @@ async def ticketpanel(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Ticket panel channel not found.", ephemeral=True)
         return
 
-    e = discord.Embed().set_footer(text="Democracy Ark Bot — United Tribes of The Island")
+    e = discord.Embed(text="Democracy Ark Bot — United Tribes of The Island")
     
         title="🎫 Support Tickets",
         color=0x95A5A6,
