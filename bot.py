@@ -3484,7 +3484,7 @@ def _dododex_slug(creature_key: str) -> str:
     return s
 
 def _dododex_cache_key(creature_slug: str, level: int, settings: CalcSettings, food_display: str) -> str:
-    return f"v2|{creature_slug}|lvl={int(level)}|taming={settings.taming_speed}|fooddrain={settings.food_drain}|sp={int(bool(settings.use_single_player_settings))}|food={food_display}"
+    return f"v3|{creature_slug}|lvl={int(level)}|taming={settings.taming_speed}|fooddrain={settings.food_drain}|sp={int(bool(settings.use_single_player_settings))}|food={food_display}"
 
 async def _dododex_cache_get(cache_key: str):
     if not DB_POOL:
@@ -3602,16 +3602,32 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                 except Exception:
                     pass
 
+                
+                # Elixir toggle (ensure OFF unless explicitly enabled in settings later)
+                try:
+                    elix = page.locator("xpath=(//*[contains(normalize-space(),'Sanguine Elixir')]/following::input[@type='checkbox'])[1]")
+                    if await elix.count() > 0:
+                        if await elix.is_checked():
+                            await elix.click()
+                except Exception:
+                    pass
+
                 await page.wait_for_timeout(1200)
 
                 food_name = (food_display or "").strip()
                 if not food_name:
                     food_name = "Kibble"
 
-                # Extract ONLY the taming results section (avoid false matches elsewhere on the page)
+                # Extract ONLY the taming results area (avoid false matches elsewhere on the page)
+                # Dododex UI varies (web/app). We anchor on the 'Taming' section that contains the
+                # QTY/MAX/TIME headers shown in Dododex.
                 results_text = ""
                 candidates = [
-                    "xpath=(//*[contains(normalize-space(),'Taming Food') and (contains(normalize-space(),'Max Time') or contains(normalize-space(),'Time'))]/ancestor::div)[1]",
+                    # Typical: a container that includes the QTY/TIME headers
+                    "xpath=(//*[contains(normalize-space(),'QTY') and contains(normalize-space(),'TIME')]/ancestor::div)[last()]",
+                    # Sometimes: 'Taming' heading near the results
+                    "xpath=(//*[normalize-space()='Taming' or contains(normalize-space(),'Taming')]/following::div[contains(.,'QTY') and contains(.,'TIME')])[1]",
+                    # Older layout fallback
                     "xpath=(//*[contains(normalize-space(),'Taming Food')]/ancestor::div)[1]",
                 ]
                 for sel in candidates:
@@ -3619,31 +3635,64 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                         loc = page.locator(sel)
                         if await loc.count() > 0:
                             results_text = await loc.first.inner_text()
-                            break
+                            if results_text:
+                                break
                     except Exception:
                         continue
                 if not results_text:
-                    # fallback: smaller scope than full body
-                    try:
-                        results_text = await page.locator("xpath=//*[contains(normalize-space(),'Taming Food')]/ancestor-or-self::*[1]").inner_text()
-                    except Exception:
-                        results_text = await page.inner_text("body")
+                    # fallback: body (last resort)
+                    results_text = await page.inner_text("body")
 
                 results_text = re.sub(r"\s+", " ", results_text)
 
-                # Patterns: "FoodName 4 13:32" or "4 FoodName 13:32"
-                pat = re.compile(rf"{re.escape(food_name)}\s+(\d+)\s+(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
-                m = pat.search(results_text)
-                if not m:
-                    pat2 = re.compile(rf"(\d+)\s+{re.escape(food_name)}\s+(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
-                    m = pat2.search(results_text)
+                # Find the specific ROW that contains the requested food name, then extract the TIME from that row.
+                # This avoids matching unrelated times elsewhere on the page.
+                row_text = ""
+                try:
+                    # Find an element that contains the food name within the results container, then take a reasonably small ancestor.
+                    food_loc = page.locator(f"xpath=(//*[contains(., {json.dumps(food_name)})])[1]")
+                    if await food_loc.count() > 0:
+                        anc = food_loc.first.locator("xpath=ancestor::*[self::div or self::tr][1]")
+                        if await anc.count() > 0:
+                            row_text = await anc.first.inner_text()
+                except Exception:
+                    row_text = ""
 
-                if not m:
-                    await browser.close()
-                    return None
+                if row_text:
+                    row_text = re.sub(r"\s+", " ", row_text)
+                else:
+                    row_text = results_text
 
-                food_pieces = int(m.group(1))
-                seconds = _parse_mmss_or_hhmmss(m.group(2))
+                # Extract time (prefer the RIGHTMOST mm:ss on the row, which corresponds to the TIME column)
+                times = re.findall(r"\b\d+:\d{2}(?::\d{2})?\b", row_text)
+                time_str = times[-1] if times else ""
+
+                # Extract QTY (first integer adjacent to the food name) and TIME (from time_str)
+                m_qty = re.search(rf"{re.escape(food_name)}\s+(\d+)\b", row_text, re.IGNORECASE)
+                if not m_qty:
+                    m_qty = re.search(rf"\b(\d+)\s+{re.escape(food_name)}\b", row_text, re.IGNORECASE)
+
+                if not m_qty or not time_str:
+                    # Fallback: try broader patterns within the results text
+                    pat = re.compile(rf"{re.escape(food_name)}\s+(\d+)\s+.*?(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
+                    m = pat.search(results_text)
+                    if m:
+                        qty = int(m.group(1))
+                        time_str = m.group(2)
+                    else:
+                        pat2 = re.compile(rf"\b(\d+)\s+{re.escape(food_name)}\s+.*?(\d+:\d{{2}}(?::\d{{2}})?)", re.IGNORECASE)
+                        m2 = pat2.search(results_text)
+                        if m2:
+                            qty = int(m2.group(1))
+                            time_str = m2.group(2)
+                        else:
+                            await browser.close()
+                            return None
+                else:
+                    qty = int(m_qty.group(1))
+                food_pieces = qty
+                seconds = _parse_mmss_or_hhmmss(time_str)
+
                 payload = {
                     "food_pieces": food_pieces,
                     "seconds": seconds,
@@ -5333,7 +5382,7 @@ async def run_tame_calculation(interaction: discord.Interaction):
                 f"• Taming Speed: **{settings.taming_speed}x**\n"
                 f"• Food Drain: **{settings.food_drain}x**\n"
                 f"• Weapon Damage: **{wdmg}%**\n"
-                "Note: Results are computed from ARK Wiki tables; if you use Single Player Settings or custom food drain, update staff settings."
+                "Note: Food/time use Dododex when available; KO/narco estimates are from Wiki tables. If you use Single Player Settings or custom food drain, update staff settings."
             ),
             inline=False,
         )
