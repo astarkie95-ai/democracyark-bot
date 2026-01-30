@@ -1,24 +1,17 @@
-FROM python:3.12-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-CMD ["python", "bot.py"]
-# Railway Dockerfile for Dododex headless fetch (Playwright)
-# If you don't want Dododex scraping, you can omit this file and ignore USE_DODODEX.
+# Merged Dockerfile (existing Railway build + Playwright/Chromium support for Dododex headless fetch)
+# Uses Playwright base image so Chromium + system deps are included.
 FROM mcr.microsoft.com/playwright/python:v1.50.0-jammy
 
 WORKDIR /app
 
+# Install deps first for better layer caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 # Copy project
-COPY . /app
+COPY . .
 
-# Install python deps if requirements.txt exists
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
-
-# Ensure playwright browsers are present (already included in base image, but keep safe)
+# Ensure Chromium is available (base image usually includes it; this keeps it explicit)
 RUN python -m playwright install chromium
 
 CMD ["python", "bot.py"]
