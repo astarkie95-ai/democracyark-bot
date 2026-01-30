@@ -3966,19 +3966,36 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     # pick food
     food_key = _pick_food(c, food_pref) or ""
     foodname_disp = food_key
+    fav_kibble = None
+    fav_kibble_short = None
     if food_key == "Kibble":
         fav = c.get("favoriteKibble") or "Kibble"
-        foodname_disp = f"{fav} Kibble"
+        fav_kibble_short = fav
+        fav_kibble = f"{fav} Kibble"
+        foodname_disp = fav_kibble
 
     # resolve affinity + foodValue
     food_affinity = 0.0
     food_value = 0.0
     sfv = c.get("specialFoodValues") or {}
-    if isinstance(sfv, dict) and food_key in sfv and isinstance(sfv[food_key], dict):
-        food_affinity = float(sfv[food_key].get("affinity") or 0.0)
-        food_value = float(sfv[food_key].get("value") or 0.0)
+    sfv_key = food_key
+    if food_key == "Kibble" and fav_kibble:
+        # Some data sources key kibble by tier (e.g. "Exceptional Kibble") rather than generic "Kibble".
+        for ktry in (fav_kibble, fav_kibble_short, "Kibble"):
+            if isinstance(sfv, dict) and ktry in sfv and isinstance(sfv[ktry], dict):
+                sfv_key = ktry
+                break
+    if isinstance(sfv, dict) and sfv_key in sfv and isinstance(sfv[sfv_key], dict):
+        food_affinity = float(sfv[sfv_key].get("affinity") or 0.0)
+        food_value = float(sfv[sfv_key].get("value") or 0.0)
 
-    fdat = _TAMING_FOOD.get(food_key) if isinstance(_TAMING_FOOD, dict) else None
+    fdat_key = food_key
+    if food_key == "Kibble" and fav_kibble:
+        for ktry in (fav_kibble, fav_kibble_short, "Kibble"):
+            if isinstance(_TAMING_FOOD, dict) and ktry in _TAMING_FOOD:
+                fdat_key = ktry
+                break
+    fdat = _TAMING_FOOD.get(fdat_key) if isinstance(_TAMING_FOOD, dict) else None
     if isinstance(fdat, dict):
         if food_affinity == 0.0:
             food_affinity = float(fdat.get("affinity") or 0.0)
@@ -3996,25 +4013,24 @@ def _compute_taming(creature_key: str, level: int, settings: CalcSettings, food_
     food_affinity_eff = food_affinity * wake_aff_mult
     food_value_eff = food_value * wake_food_mult
 
-    # Kibble values from the wiki TamingTable are legacy/generic and under-estimate Dododex/ASA kibble affinity.
-    # Apply a small scaling so kibble counts align with Dododex (keeps all other foods untouched).
-    if food_key == "Kibble":
-        food_affinity_eff *= 3.25
-
     food_pieces = int(math.ceil(affinity_needed / food_affinity_eff))
 
-    # time: either constantFeedingInterval, else based on food drain
+    # time: driven by hunger ticks (Dododex-style). First-bite delay is applied once.
+    first_bite_delay = float(c.get("firstBiteDelay") or c.get("firstFeedingInterval") or 0.0)
+
     if c.get("constantFeedingInterval") is not None:
-        seconds = int(float(c.get("constantFeedingInterval")) * food_pieces)
+        interval = float(c.get("constantFeedingInterval") or 0.0)
+        seconds = int(math.ceil(first_bite_delay + max(0, food_pieces - 1) * interval))
     else:
         base = float(c.get("foodConsumptionBase") or 0.0)
         mult = float(c.get("foodConsumptionMult") or 0.0)
         denom = base * mult * food_drain_mult
         if denom <= 0:
-            seconds = 0
+            seconds = int(math.ceil(first_bite_delay))
         else:
             # The wiki module's consumption values are per 0.5s tick; convert to real seconds.
-            seconds = int(math.ceil(food_pieces * abs(food_value_eff) / denom * 0.5))
+            interval = abs(food_value_eff) / denom * 0.5
+            seconds = int(math.ceil(first_bite_delay + max(0, food_pieces - 1) * interval))
 
     # correction hacks used on wiki
     # NOTE: Dododex-style timing does NOT apply the wiki's resultCorrection multiplier.
