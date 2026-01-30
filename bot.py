@@ -301,7 +301,7 @@ class PollView(discord.ui.View):
                 if not interaction.response.is_done():
                     await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         poll = POLL_BY_CHANNEL.get(self.channel_id)
@@ -309,7 +309,7 @@ class PollView(discord.ui.View):
             try:
                 await interaction.response.send_message("ℹ️ No active poll found.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         # Ensure the click belongs to the current poll message
@@ -318,13 +318,13 @@ class PollView(discord.ui.View):
                 await interaction.response.send_message("ℹ️ This poll is no longer active.", ephemeral=True)
                 return
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         if poll.ended:
             try:
                 await interaction.response.send_message("🔒 This poll is closed.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         # Record vote (allow changing)
@@ -332,14 +332,14 @@ class PollView(discord.ui.View):
         try:
             await db_record_poll_vote(poll.message_id, int(interaction.user.id), int(option_index))
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # Update the poll message (counts)
         try:
             if interaction.message:
                 await interaction.message.edit(embed=poll_embed(poll), view=self)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # Always acknowledge
         try:
@@ -354,7 +354,7 @@ class PollView(discord.ui.View):
                     ephemeral=True,
                 )
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 
 async def create_poll_in_channel(
@@ -406,13 +406,13 @@ async def create_poll_in_channel(
     try:
         await db_upsert_poll(poll.message_id, poll.channel_id, poll.question, poll.options, ended=False)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     # Ensure the view stays alive across restarts
     try:
         bot.add_view(view)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     return True, "Poll posted."
 
@@ -738,7 +738,7 @@ async def db_init() -> None:
                 await conn.execute("ALTER TABLE calc_settings ADD COLUMN IF NOT EXISTS cuddle_interval_mult DOUBLE PRECISION NOT NULL DEFAULT 1.0;")
                 await conn.execute("ALTER TABLE calc_settings ADD COLUMN IF NOT EXISTS imprint_amount_mult DOUBLE PRECISION NOT NULL DEFAULT 1.0;")
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
             print("✅ DB: tables ensured.", flush=True)
             print("✅ DB: ticket tables ensured.", flush=True)
@@ -1010,7 +1010,7 @@ def is_staff_member(member: discord.Member) -> bool:
         if member.guild_permissions.administrator or member.guild_permissions.manage_guild or member.guild_permissions.manage_channels:
             return True
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
     if not STAFF_ROLE_IDS:
         return False
     for r in getattr(member, "roles", []):
@@ -1097,7 +1097,7 @@ def is_owner_member(member: discord.Member) -> bool:
             if r and r.id == int(OWNERS_ROLE_ID):
                 return True
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
     return False
 
 async def _restart_log(guild: discord.Guild, text: str) -> None:
@@ -1108,7 +1108,7 @@ async def _restart_log(guild: discord.Guild, text: str) -> None:
         try:
             await ch.send(text)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 async def _nitrado_post_action(action_label: str, endpoint_suffixes: List[str]) -> Tuple[bool, str]:
     """
@@ -1187,7 +1187,7 @@ class RestartMessageModal(discord.ui.Modal, title="Restart Democracy Ark"):
             try:
                 await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         msg = str(self.restart_message.value or "").strip()
@@ -1207,7 +1207,7 @@ class RestartMessageModal(discord.ui.Modal, title="Restart Democracy Ark"):
                 ephemeral=True,
             )
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 
 class RestartConfirmView(discord.ui.View):
@@ -1226,7 +1226,7 @@ class RestartConfirmView(discord.ui.View):
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         return False
 
     @discord.ui.button(label="Confirm restart", style=discord.ButtonStyle.danger)
@@ -1239,21 +1239,21 @@ class RestartConfirmView(discord.ui.View):
             try:
                 await interaction.response.edit_message(content=f"⏳ Cooldown active. Try again in {wait}s.", view=None)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         # Defer quickly
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # ✅ NEW: Announce restart publicly (optional)
         try:
             if interaction.guild:
                 await _announce_restart(interaction.guild, self.announcement, interaction.user)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         ok, msg = await nitrado_restart_call()
         if ok:
@@ -1271,7 +1271,7 @@ class RestartConfirmView(discord.ui.View):
             try:
                 await interaction.followup.send("🔄 **Restart requested.** Nitrado will reboot the server shortly.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
             if interaction.guild:
                 await _restart_log(
@@ -1282,14 +1282,14 @@ class RestartConfirmView(discord.ui.View):
             try:
                 await interaction.followup.send(f"❌ {msg}", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
         try:
             await interaction.response.edit_message(content="Cancelled.", view=None)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 
 # =====================================================================
@@ -1508,7 +1508,7 @@ async def nitrado_status_call():
                         players = nums[0]
                         slots = nums[1]
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
 
             ip = _coalesce(
@@ -1612,7 +1612,7 @@ def _build_status_embed(payload: Dict[str, Any]) -> discord.Embed:
                     inline=False,
                 )
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     return e
 
@@ -1627,7 +1627,7 @@ async def _ensure_status_message(guild: discord.Guild) -> Optional[discord.Messa
         try:
             return await ch.fetch_message(int(_STATUS_MESSAGE_ID_RUNTIME))
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     # create new module message
     try:
@@ -1658,7 +1658,7 @@ async def _announce_restart(guild: discord.Guild, message: str, requester: Optio
     try:
         await ch.send(content=ping, embed=e, allowed_mentions=_alert_allowed_mentions())
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 async def _announce_status_change(guild: discord.Guild, old_raw: str, new_raw: str) -> None:
     """Post a human-friendly alert when the server is going offline/online.
@@ -1701,7 +1701,7 @@ async def _announce_status_change(guild: discord.Guild, old_raw: str, new_raw: s
         await ch.send(msg, allowed_mentions=_alert_allowed_mentions())
         _STATUS_LAST_ANNOUNCE_AT = now
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 @tasks.loop(seconds=60)
 async def nitrado_status_loop():
@@ -1797,14 +1797,14 @@ class ServerActionModal(discord.ui.Modal):
             try:
                 await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         if interaction.user.id != self.requester_id:
             try:
                 await interaction.response.send_message("❌ Only the requester can use this form.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         msg = str(self.message.value or "").strip()
@@ -1820,7 +1820,7 @@ class ServerActionModal(discord.ui.Modal):
                 view=view,
             )
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 class ServerActionConfirmView(discord.ui.View):
     def __init__(self, requester_id: int, action: str, announcement: str):
@@ -1839,7 +1839,7 @@ class ServerActionConfirmView(discord.ui.View):
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         return False
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
@@ -1849,14 +1849,14 @@ class ServerActionConfirmView(discord.ui.View):
             try:
                 await interaction.response.edit_message(content="❌ Server context required.", view=None)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         if not is_staff_member(interaction.user):
             try:
                 await interaction.response.edit_message(content="❌ Staff only.", view=None)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         # ✅ ACK immediately to avoid "This interaction failed"
@@ -1881,7 +1881,7 @@ class ServerActionConfirmView(discord.ui.View):
         try:
             await _announce_server_action(interaction.guild, self.action, self.announcement, interaction.user)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # Call Nitrado action
         try:
@@ -1901,7 +1901,7 @@ class ServerActionConfirmView(discord.ui.View):
                 f"{self.action.upper()} by {interaction.user} ({interaction.user.id}) — {msg}",
             )
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # Send final result to the admin (ephemeral)
         try:
@@ -1910,14 +1910,14 @@ class ServerActionConfirmView(discord.ui.View):
                 ephemeral=True,
             )
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
         try:
             await interaction.response.edit_message(content="Cancelled.", view=None)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 # =====================================================================
 # ✅ NEW: Persistent 24/7 Server Control Panel message (no command needed)
@@ -1953,7 +1953,7 @@ class PersistentServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
 
         if not is_staff_member(interaction.user):
@@ -1963,7 +1963,7 @@ class PersistentServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message("❌ Staff only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
 
         return True
@@ -1980,7 +1980,7 @@ class PersistentServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.secondary, custom_id="serverctl_stop")
     async def stop_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -1994,7 +1994,7 @@ class PersistentServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Restart", style=discord.ButtonStyle.danger, custom_id="serverctl_restart")
     async def restart_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -2008,7 +2008,7 @@ class PersistentServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
 async def ensure_server_control_panel(guild: discord.Guild) -> None:
     """Ensure the 24/7 control panel message exists and has buttons attached."""
@@ -2029,7 +2029,7 @@ async def ensure_server_control_panel(guild: discord.Guild) -> None:
             await msg.edit(embed=embed, view=view)
             return
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     try:
         msg = await ch.send(embed=embed, view=view)
@@ -2039,9 +2039,9 @@ async def ensure_server_control_panel(guild: discord.Guild) -> None:
             try:
                 await msg.pin(reason="Democracy Bot: server control panel")
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 class ServerControlView(discord.ui.View):
     def __init__(self, requester_id: int):
@@ -2058,7 +2058,7 @@ class ServerControlView(discord.ui.View):
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         return False
 
     @discord.ui.button(label="Start", style=discord.ButtonStyle.success)
@@ -2073,7 +2073,7 @@ class ServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.secondary)
     async def stop_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -2087,7 +2087,7 @@ class ServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Restart", style=discord.ButtonStyle.danger)
     async def restart_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -2101,7 +2101,7 @@ class ServerControlView(discord.ui.View):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
 async def _announce_server_action(guild: discord.Guild, action: str, message: str, requester: Optional[discord.Member] = None) -> None:
     # Alerts channel preference: SERVER_ALERTS_CHANNEL_ID -> legacy SERVER_ANNOUNCE_CHANNEL_ID -> status channel
@@ -2131,7 +2131,7 @@ async def _announce_server_action(guild: discord.Guild, action: str, message: st
     try:
         await ch.send(content=ping, embed=e, allowed_mentions=_alert_allowed_mentions())
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 # =====================================================================
 # ✅ NEW: Starter Kit + Poll MODULE PANELS (no commands needed for players)
 # =====================================================================
@@ -2236,7 +2236,7 @@ class StarterKitPanelView(discord.ui.View):
                     ephemeral=True,
                 )
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         # One per person check
@@ -2248,7 +2248,7 @@ class StarterKitPanelView(discord.ui.View):
                     ephemeral=True,
                 )
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         if not PINS_POOL:
@@ -2258,7 +2258,7 @@ class StarterKitPanelView(discord.ui.View):
                     ephemeral=True,
                 )
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         # Pick lowest box number available
@@ -2276,7 +2276,7 @@ class StarterKitPanelView(discord.ui.View):
                 async with DB_POOL.acquire() as con:
                     await db_mark_user_claimed(con, uid, box=bp.box, pin=bp.pin)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
         else:
             await save_claimed_users_only()
         msg = (
@@ -2290,18 +2290,18 @@ class StarterKitPanelView(discord.ui.View):
         try:
             await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         try:
             await interaction.user.send(msg)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # Refresh panel counts
         try:
             if interaction.guild:
                 await refresh_starter_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Claim Starter Kit", style=discord.ButtonStyle.primary, custom_id="starterpanel_claim")
     async def claim_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -2320,7 +2320,7 @@ class StarterKitPanelView(discord.ui.View):
                     ephemeral=True,
                 )
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
         else:
             try:
                 await interaction.response.send_message(
@@ -2328,7 +2328,7 @@ class StarterKitPanelView(discord.ui.View):
                     ephemeral=True,
                 )
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
 async def _ensure_panel_message(
     guild: discord.Guild,
@@ -2357,7 +2357,7 @@ async def _ensure_panel_message(
             await msg.edit(embed=embed, view=view)
             return int(msg.id)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     # Try to reuse an existing pinned/recent panel to avoid duplicates (even if Railway message id isn't set)
     title = expected_embed_title or (embed.title or "")
@@ -2375,7 +2375,7 @@ async def _ensure_panel_message(
                     except Exception:
                         continue
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # 2) Recent history (last 50)
         try:
@@ -2389,7 +2389,7 @@ async def _ensure_panel_message(
                     except Exception:
                         continue
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
     try:
         msg = await ch.send(embed=embed, view=view)
@@ -2397,7 +2397,7 @@ async def _ensure_panel_message(
             try:
                 await msg.pin(reason="Democracy Bot: module panel")
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
         return int(msg.id)
     except Exception:
         return None
@@ -2435,7 +2435,7 @@ async def refresh_starter_panel(guild: discord.Guild) -> None:
         msg = await ch.fetch_message(int(_STARTER_PANEL_MESSAGE_ID_RUNTIME))
         await msg.edit(embed=_build_starter_panel_embed(), view=StarterKitPanelView())
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 
 # -----------------------
@@ -2492,14 +2492,14 @@ class PollCreateModal(discord.ui.Modal, title="Create a poll"):
             try:
                 await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         if not is_admin(interaction):
             try:
                 await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         q = str(self.question.value or "").strip()
@@ -2508,25 +2508,25 @@ class PollCreateModal(discord.ui.Modal, title="Create a poll"):
             try:
                 await interaction.response.send_message("❌ Please provide at least 2 options.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
         opts = opts[:10]
 
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         ok, msg = await create_poll_in_channel(interaction.guild, self.channel_id, q, opts, created_by=interaction.user)
         try:
             await interaction.followup.send(("✅ " if ok else "❌ ") + msg, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         try:
             await refresh_poll_panel(interaction.guild, self.channel_id)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 class PersistentPollPanelView(discord.ui.View):
     def __init__(self):
@@ -2538,13 +2538,13 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
         if not is_admin(interaction):
             try:
                 await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         ch_id_str = _poll_vote_channel_id()
@@ -2552,7 +2552,7 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message("❌ Poll channel not configured.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         try:
@@ -2561,7 +2561,7 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Results", style=discord.ButtonStyle.secondary, custom_id="pollpanel_results")
     async def results_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -2570,14 +2570,14 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         if not is_admin(interaction):
             try:
                 await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         ch_id_str = _poll_vote_channel_id()
@@ -2585,7 +2585,7 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message("❌ Poll channel not configured.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         channel_id = int(ch_id_str)
@@ -2594,13 +2594,13 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message("ℹ️ No active poll found.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         try:
             await interaction.followup.send(poll_results_text(poll), ephemeral=True)
@@ -2612,7 +2612,7 @@ class PersistentPollPanelView(discord.ui.View):
                 else:
                     await interaction.response.send_message("❌ Could not display results.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
     @discord.ui.button(label="End Poll (Admin)", style=discord.ButtonStyle.danger, custom_id="pollpanel_end")
     async def end_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not interaction.guild:
@@ -2621,14 +2621,14 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
         ch_id_str = _poll_vote_channel_id()
         if not _is_digit_id(ch_id_str):
             try:
                 await interaction.response.send_message("❌ Poll channel not configured.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
         channel_id = int(ch_id_str)
         poll = POLL_BY_CHANNEL.get(channel_id)
@@ -2636,14 +2636,14 @@ class PersistentPollPanelView(discord.ui.View):
             try:
                 await interaction.response.send_message("ℹ️ No active poll to end.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
 
         poll.ended = True
         try:
             await db_set_poll_ended(poll.message_id, True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         try:
             ch = await _get_text_channel(interaction.guild, str(poll.channel_id))
@@ -2651,17 +2651,17 @@ class PersistentPollPanelView(discord.ui.View):
                 msg = await ch.fetch_message(poll.message_id)
                 await msg.edit(embed=poll_embed(poll), view=None)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         try:
             await interaction.response.send_message("✅ Poll ended.", ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         try:
             await refresh_poll_panel(interaction.guild, channel_id)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 
 # ----------------------- Starter Vault Admin Panel (staff) -----------------------
@@ -2889,14 +2889,14 @@ class StarterVaultAdminView(discord.ui.View):
             try:
                 await interaction.response.send_message("❌ This panel only works inside the server.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
 
         if not is_staff_member(interaction.user):
             try:
                 await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
 
         return True
@@ -2930,7 +2930,7 @@ class StarterVaultAdminView(discord.ui.View):
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         if not CLAIMS:
             await interaction.followup.send("No starter vault claims yet.", ephemeral=True)
@@ -2949,7 +2949,7 @@ class StarterVaultAdminView(discord.ui.View):
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         avail = len(PINS_POOL)
         claimed = len(CLAIMS)
         await interaction.followup.send(f"Available vaults: {avail}\nClaimed vaults: {claimed}", ephemeral=True)
@@ -3021,7 +3021,7 @@ async def refresh_poll_panel(guild: discord.Guild, vote_channel_id: int) -> None
         active = POLL_BY_CHANNEL.get(int(vote_channel_id))
         await msg.edit(embed=_build_poll_panel_embed(active if active and not active.ended else None), view=PersistentPollPanelView())
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 
 
@@ -3106,7 +3106,7 @@ class GetRoleView(discord.ui.View):
                 else:
                     await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
         return True
 
@@ -3183,7 +3183,7 @@ class _RoleAddModal(discord.ui.Modal, title="Add self-assign role"):
             try:
                 await db_upsert_self_role(int(rid), lab, desc)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
         else:
             await save_self_roles_only()
 
@@ -3191,7 +3191,7 @@ class _RoleAddModal(discord.ui.Modal, title="Add self-assign role"):
             await ensure_role_manager_panel(interaction.guild)
             await ensure_self_roles_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         await interaction.response.send_message(f"✅ Added **{role.name}** to self-assign roles.", ephemeral=True)
 
@@ -3223,7 +3223,7 @@ class _RoleRemoveModal(discord.ui.Modal, title="Remove self-assign role"):
             try:
                 await db_delete_self_role(int(rid))
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
         else:
             await save_self_roles_only()
 
@@ -3231,7 +3231,7 @@ class _RoleRemoveModal(discord.ui.Modal, title="Remove self-assign role"):
             await ensure_role_manager_panel(interaction.guild)
             await ensure_self_roles_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         await interaction.response.send_message("✅ Removed from self-assign list.", ephemeral=True)
 
@@ -3342,7 +3342,7 @@ class RoleManagerView(discord.ui.View):
                 else:
                     await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
         if not is_staff_member(interaction.user):
             try:
@@ -3351,7 +3351,7 @@ class RoleManagerView(discord.ui.View):
                 else:
                     await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
         return True
 
@@ -3387,7 +3387,7 @@ class RoleManagerView(discord.ui.View):
             await ensure_get_role_panel(interaction.guild)
             await ensure_self_roles_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         await interaction.response.send_message("✅ Refreshed role panels.", ephemeral=True)
 
 async def ensure_role_manager_panel(guild: discord.Guild) -> None:
@@ -3617,7 +3617,7 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                 try:
                     await fd_loc.press("Enter")
                 except Exception:
-                    pass
+                    print(traceback.format_exc(), flush=True)
 
                 # SP toggle
                 try:
@@ -3627,7 +3627,7 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                     if is_checked != want:
                         await sp_in.click()
                 except Exception:
-                    pass
+                    print(traceback.format_exc(), flush=True)
 
                 await page.wait_for_timeout(1200)
 
@@ -3641,7 +3641,7 @@ async def dododex_fetch_taming(creature_key: str, level: int, settings: CalcSett
                     if await el_in.count() > 0 and await el_in.is_checked():
                         await el_in.click()
                 except Exception:
-                    pass
+                    print(traceback.format_exc(), flush=True)
 
                 await page.wait_for_timeout(1200)
 
@@ -3754,7 +3754,7 @@ async def calc_set_settings(guild_id: int, settings: CalcSettings) -> None:
                 int(time.time()),
             )
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 def _find_channel_by_name(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
     for ch in guild.text_channels:
@@ -3856,7 +3856,7 @@ class _CalcRatesBasicModal(discord.ui.Modal, title="Set Calculator Rates (Basic)
             await ensure_calc_settings_panel(interaction.guild)
             await ensure_tame_calculator_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         await interaction.response.send_message("✅ Basic calculator rates updated.", ephemeral=True)
 
@@ -3897,7 +3897,7 @@ class _CalcRatesAdvancedModal(discord.ui.Modal, title="Set Calculator Rates (Adv
             await ensure_calc_settings_panel(interaction.guild)
             await ensure_tame_calculator_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         await interaction.response.send_message("✅ Advanced calculator rates updated.", ephemeral=True)
 
@@ -3915,7 +3915,7 @@ class CalcSettingsView(discord.ui.View):
                 else:
                     await interaction.response.send_message("❌ Server context required.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
         if not is_staff_member(interaction.user):
             try:
@@ -3924,7 +3924,7 @@ class CalcSettingsView(discord.ui.View):
                 else:
                     await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return False
         return True
     @discord.ui.button(label="Set Rates (Basic)", style=discord.ButtonStyle.primary, custom_id="calc_settings:set_rates_basic")
@@ -3938,7 +3938,7 @@ class CalcSettingsView(discord.ui.View):
                 else:
                     await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     @discord.ui.button(label="Set Rates (Advanced)", style=discord.ButtonStyle.secondary, custom_id="calc_settings:set_rates_adv")
     async def set_rates_adv(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3951,7 +3951,7 @@ class CalcSettingsView(discord.ui.View):
                 else:
                     await interaction.response.send_message(f"❌ Could not open form: {repr(e)}", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
     @discord.ui.button(label="Reset to Defaults", style=discord.ButtonStyle.secondary, custom_id="calc_settings:reset_defaults")
     async def reset_defaults(self, interaction: discord.Interaction, button: discord.ui.Button):
         await calc_set_settings(interaction.guild_id, CalcSettings())
@@ -3959,7 +3959,7 @@ class CalcSettingsView(discord.ui.View):
             await ensure_calc_settings_panel(interaction.guild)
             await ensure_tame_calculator_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         await interaction.response.send_message("✅ Reset to defaults.", ephemeral=True)
 
 # ---- Taming data (auto-loaded from ARK Wiki/Fandom Module:TamingTable) ----
@@ -4608,7 +4608,7 @@ async def ensure_breeding_data_loaded(force: bool = False) -> bool:
                     _BREEDING_LOADED_AT = int(time.time())
                     return True
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # 2) Fallback: map ARKStatsExtractor raw values into a usable dict
         try:
@@ -4720,7 +4720,7 @@ class _TameCalcModal(discord.ui.Modal, title="Tame Calculator"):
                 else:
                     await interaction.response.send_message(content=content, embed=embed, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
         try:
             await interaction.response.defer(ephemeral=True)
@@ -4819,12 +4819,12 @@ class _BreedingCalcModal(discord.ui.Modal, title="Breeding Calculator"):
                 else:
                     await interaction.response.send_message(content=content, embed=embed, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         settings = await calc_get_settings(interaction.guild_id)
 
@@ -4932,7 +4932,7 @@ async def _defer_calc_if_needed(interaction: discord.Interaction) -> None:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 async def _ensure_tame_data(interaction: discord.Interaction) -> bool:
     # Fast path: already loaded in memory
@@ -5095,7 +5095,7 @@ class _TameFlowView(discord.ui.View):
             else:
                 await interaction.response.edit_message(content="✅ Closed.", embed=None, view=None)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 
 class _SetLevelModal(discord.ui.Modal, title="Set Wild Level"):
@@ -5116,7 +5116,7 @@ class _SetLevelModal(discord.ui.Modal, title="Set Wild Level"):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
         await start_tame_calculator_flow(interaction, edit=True)
 
@@ -5139,7 +5139,7 @@ class _SetWeaponPctModal(discord.ui.Modal, title="Set Weapon Damage %"):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
         await start_tame_calculator_flow(interaction, edit=True)
 
@@ -5159,7 +5159,7 @@ class _SetLevelBtn(discord.ui.Button):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
 
 class _SetWeaponPctBtn(discord.ui.Button):
@@ -5177,7 +5177,7 @@ class _SetWeaponPctBtn(discord.ui.Button):
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
 
 class _CycleWeaponBtn(discord.ui.Button):
@@ -5304,7 +5304,7 @@ async def start_tame_calculator_flow(interaction: discord.Interaction, edit: boo
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 
 
@@ -5336,7 +5336,7 @@ async def run_tame_calculation(interaction: discord.Interaction):
     try:
         await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     settings = await calc_get_settings(interaction.guild.id)
 
@@ -5399,7 +5399,7 @@ async def run_tame_calculation(interaction: discord.Interaction):
             try:
                 e.add_field(name="Dododex Source", value=f"{dodo.get('source')}\n{dodo.get('url', '')}", inline=False)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
         e.add_field(
             name="Assumptions",
@@ -5418,7 +5418,7 @@ async def run_tame_calculation(interaction: discord.Interaction):
             else:
                 await interaction.response.send_message(embed=e, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
     except Exception as ex:
         try:
             msg = f"⚠️ Calculation failed: {ex}"
@@ -5427,7 +5427,7 @@ async def run_tame_calculation(interaction: discord.Interaction):
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 # Breeding flow (dropdown-first; creature selection reused)
 class _BreedingFlowView(discord.ui.View):
@@ -5512,7 +5512,7 @@ async def start_breeding_calculator_flow(interaction: discord.Interaction, edit:
             else:
                 await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 
 async def run_breeding_calculation(interaction: discord.Interaction):
@@ -5528,7 +5528,7 @@ async def run_breeding_calculation(interaction: discord.Interaction):
     try:
         await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     settings = await calc_get_settings(interaction.guild.id)
     try:
@@ -5598,22 +5598,22 @@ class TameCalculatorView(discord.ui.View):
             try:
                 await interaction.response.send_message("🔒 Staff only.", ephemeral=True)
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
             return
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         ok1 = await ensure_taming_data_loaded(force=True)
         ok2 = await ensure_breeding_data_loaded(force=True)
         try:
             await ensure_tame_calculator_panel(interaction.guild)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         try:
             await interaction.followup.send(f"✅ Reload complete. Taming: {'OK' if ok1 else 'FAIL'} • Breeding: {'OK' if ok2 else 'FAIL'}", ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 
 async def ensure_tame_calculator_panel(guild: discord.Guild) -> None:
@@ -5807,7 +5807,7 @@ def save_claimed_users_state(users: Set[int]) -> None:
                 except Exception:
                     continue
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 
 
@@ -5901,7 +5901,7 @@ async def load_state() -> None:
                 except Exception:
                     continue
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
         # ✅ load self-assign roles list
         try:
@@ -6105,7 +6105,7 @@ async def serverpanel(interaction: discord.Interaction):
         try:
             await interaction.response.send_message("❌ Could not open panel.", ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
 
 # -----------------------
 # ✅ Admin: test welcome message
@@ -6251,7 +6251,7 @@ async def addpins(interaction: discord.Interaction, box: int, pin: str):
         if interaction.guild:
             await refresh_starter_panel(interaction.guild)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await interaction.response.send_message(
         f"✅ Added starter kit to pool.\n**Box:** #{box}\n**PIN:** `{pin}`\n\n{pool_counts()}",
@@ -6305,7 +6305,7 @@ async def addpinsbulk(interaction: discord.Interaction, lines: str):
         if interaction.guild:
             await refresh_starter_panel(interaction.guild)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await interaction.response.send_message(
         f"✅ Bulk add complete.\nAdded: **{added}** | Skipped: **{skipped}**\n\n{pool_counts()}",
@@ -6465,7 +6465,7 @@ async def claimstarter(interaction: discord.Interaction):
             async with DB_POOL.acquire() as con:
                 await db_mark_user_claimed(con, uid, box=box, pin=pin)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
     else:
         await save_claimed_users_only()
 
@@ -6478,7 +6478,7 @@ async def claimstarter(interaction: discord.Interaction):
             await refresh_starter_panel(interaction.guild)
             await ensure_starter_admin_panel(interaction.guild)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await interaction.response.send_message(
         f"🎁 Starter kit claimed!\nVault: **#{box}**\nPIN: **{pin}**",
@@ -6547,13 +6547,13 @@ async def poll_create(
     try:
         await interaction.response.send_message("✅ Poll created.", ephemeral=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     # Refresh poll panel
     try:
         await refresh_poll_panel(interaction.guild, int(interaction.channel.id))
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 @bot.tree.command(name="pollresults", description="Admin: Show results for the current poll in this channel.")
 async def poll_results(interaction: discord.Interaction):
@@ -6594,21 +6594,21 @@ async def poll_end(interaction: discord.Interaction):
     try:
         await db_set_poll_ended(poll.message_id, True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     # Update the public message to show closed + final counts
     try:
         msg = await interaction.channel.fetch_message(poll.message_id)
         await msg.edit(embed=poll_embed(poll), view=None)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await interaction.response.send_message("✅ Poll ended. Voting is now closed.", ephemeral=True)
 
     try:
         await refresh_poll_panel(interaction.guild, int(interaction.channel.id))
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 @bot.tree.command(name="polldelete", description="Admin: Delete the poll message and remove the poll.")
 async def poll_delete(interaction: discord.Interaction):
@@ -6633,20 +6633,20 @@ async def poll_delete(interaction: discord.Interaction):
         msg = await interaction.channel.fetch_message(poll.message_id)
         await msg.delete()
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     POLL_BY_CHANNEL.pop(channel_id, None)
     try:
         await db_delete_poll(poll.message_id)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await interaction.response.send_message("🗑️ Poll deleted.", ephemeral=True)
 
     try:
         await refresh_poll_panel(interaction.guild, int(interaction.channel.id))
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 # =====================================================================
 # FULL TICKET SYSTEM (DB-backed, channel-based, transcripts, staff tools)
@@ -6699,7 +6699,7 @@ async def _log_ticket_event(guild: discord.Guild, text: str, embed: Optional[dis
         else:
             await ch.send(content=text)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 async def _db_fetchrow(query: str, *args) -> Optional[asyncpg.Record]:
     if DB_POOL is None:
@@ -6815,7 +6815,7 @@ async def _ticket_intro_message(channel: discord.TextChannel, owner: discord.Mem
     try:
         await channel.send(content=f"{owner.mention} ✅ Ticket created.", embed=e, view=TicketControlsView())
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 class TicketCreateModal(discord.ui.Modal, title="Create a ticket"):
     subject = discord.ui.TextInput(label="Subject", required=False, max_length=120)
@@ -6906,7 +6906,7 @@ async def create_ticket_flow(interaction: discord.Interaction, ticket_type: str,
         try:
             await interaction.response.send_message("❌ Server context required.", ephemeral=True)
         except Exception:
-            pass
+            print(traceback.format_exc(), flush=True)
         return
 
     guild = interaction.guild
@@ -6975,7 +6975,7 @@ async def create_ticket_flow(interaction: discord.Interaction, ticket_type: str,
     try:
         await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await _ticket_intro_message(channel, user, ticket_id, ticket_type, subject, details)
 
@@ -7040,7 +7040,7 @@ async def ticket_close_action(interaction: discord.Interaction, reason: str = ""
             ow.add_reactions = False
             await interaction.channel.set_permissions(owner, overwrite=ow, reason="Ticket closed")
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await _db_execute(
         "UPDATE tickets SET status='closed', closed_at=$2, updated_at=$2 WHERE id=$1;",
@@ -7089,7 +7089,7 @@ async def ticket_reopen_action(interaction: discord.Interaction) -> None:
             ow.add_reactions = True
             await interaction.channel.set_permissions(owner, overwrite=ow, reason="Ticket reopened")
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await _db_execute(
         "UPDATE tickets SET status='open', closed_at=NULL, updated_at=$2 WHERE id=$1;",
@@ -7251,7 +7251,7 @@ async def ticket_transcript_action(interaction: discord.Interaction) -> None:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     # Fetch messages
     lines: List[str] = []
@@ -7287,7 +7287,7 @@ async def ticket_transcript_action(interaction: discord.Interaction) -> None:
                 await logch.send(embed=embed, file=file)
                 posted = True
             except Exception:
-                pass
+                print(traceback.format_exc(), flush=True)
 
     if not posted:
         await _log_ticket_event(interaction.guild, "", embed=embed)
@@ -7297,7 +7297,7 @@ async def ticket_transcript_action(interaction: discord.Interaction) -> None:
     try:
         await interaction.followup.send("✅ Transcript generated and posted to ticket logs.", ephemeral=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
 async def ticket_delete_action(interaction: discord.Interaction, reason: str = "") -> None:
     t = await _get_ticket_or_reply(interaction)
@@ -7315,13 +7315,13 @@ async def ticket_delete_action(interaction: discord.Interaction, reason: str = "
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     # Try transcript first (best-effort)
     try:
         await ticket_transcript_action(interaction)
     except Exception:
-        pass
+        print(traceback.format_exc(), flush=True)
 
     await _db_execute(
         "UPDATE tickets SET status='deleted', updated_at=$2 WHERE id=$1;",
